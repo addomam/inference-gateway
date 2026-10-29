@@ -1,0 +1,26 @@
+/target/
+/data/
+/infer.toml
+.env
+*.auth.json
+auth.json
+
+# Local Python bytecode and macOS directory metadata.
+__pycache__/
+.DS_Store
+
+# Local credentials and agent state must stay out of public snapshots.
+.env.*
+!.env.example
+!.env.sample
+!.env.template
+/.agents/
+/.claude/
+/.codex/
+
+# Private development records and publication staging.
+/specs/
+/scripts
+/tools/
+/PUBLICATION_AUDIT.md
+/publication/

@@ -1,0 +1,110 @@
+# Copy to infer.toml. Secrets stay in environment variables or Codex's auth file.
+listen = "127.0.0.1:8080"
+control_listen = "127.0.0.1:8081"
+proxy_token_env = "INFER_PROXY_TOKEN"
+control_token_env = "INFER_CONTROL_TOKEN"
+trace_dir = "./data"
+default_provider = "openai"
+max_request_bytes = 33554432
+max_buffered_response_bytes = 33554432
+connect_timeout_seconds = 10
+read_timeout_seconds = 300
+
+# base_url normally uses the origin without /v1. Deployment prefixes are allowed.
+# Codex requires its backend-specific prefix.
+# Remove providers you do not use. Configured api_key/bearer modes require their
+# environment variables at startup, even if that provider is not the default.
+[providers.openai]
+kind = "openai"
+base_url = "https://api.openai.com"
+namespace = "openai"
+[providers.openai.auth]
+mode = "api_key"
+token_env = "OPENAI_API_KEY"
+
+# Native OpenAI Decisions API. Keep this separate from the generation provider:
+# API-key entitlement is not supplied by a ChatGPT/Codex subscription.
+[providers.openai_decisions]
+kind = "openai_decisions"
+base_url = "https://api.openai.com"
+namespace = "openai"
+[providers.openai_decisions.auth]
+mode = "api_key"
+token_env = "OPENAI_API_KEY"
+
+# Native Cloudflare Clairic extraction API. Account IDs remain in each canonical
+# /client/v4/accounts/ACCOUNT/ai/run/@cf/cloudflare/clairic request path.
+[providers.cloudflare]
+kind = "clairic"
+base_url = "https://api.cloudflare.com"
+[providers.cloudflare.auth]
+mode = "bearer"
+token_env = "CLOUDFLARE_API_TOKEN"
+
+[providers.anthropic]
+kind = "anthropic"
+base_url = "https://api.anthropic.com"
+[providers.anthropic.auth]
+mode = "api_key"
+token_env = "ANTHROPIC_API_KEY"
+
+[providers.grok]
+kind = "grok"
+base_url = "https://api.x.ai"
+namespace = "xai"
+[providers.grok.auth]
+mode = "bearer"
+token_env = "XAI_TOKEN"
+
+# System One decision API (Jev); not a Chat/Responses-compatible backend.
+[providers.typesafe]
+kind = "system_one"
+base_url = "https://api.typesafe.ai"
+[providers.typesafe.auth]
+mode = "api_key"
+token_env = "TYPESAFE_API_KEY"
+
+[providers.llama]
+kind = "llama"
+base_url = "http://127.0.0.1:8082"
+[providers.llama.auth]
+mode = "none"
+
+# Run `codex login` first with Codex file credential storage enabled.
+# Replace this path: '~' and environment substitutions are NOT expanded in TOML.
+[providers.chatgpt]
+kind = "codex"
+base_url = "https://chatgpt.com/backend-api/codex"
+[providers.chatgpt.auth]
+mode = "codex"
+auth_file = "/absolute/path/to/.codex/auth.json"
+
+# Model resolution, in order: exact alias, then configured namespace/model,
+# then the compiled catalog, then default_provider with the original model.
+# An unconfigured prefix stays part of the model id, including during catalog lookup.
+# Typed API kinds never translate to generation. No hidden substitution or
+# automatic provider fallback.
+[models.code]
+provider = "chatgpt"
+model = "gpt-5.4"
+
+[models.local]
+provider = "llama"
+model = "local-model"
+
+[models.jev]
+provider = "typesafe"
+model = "jev-latest"
+
+[models.luna]
+provider = "openai_decisions"
+model = "gpt-6-luna"
+
+# Both model strings are documented by Clairic's native input schema.
+[models.clairic]
+provider = "cloudflare"
+model = "@cf/cloudflare/clairic"
+
+[models."@cf/cloudflare/clairic"]
+provider = "cloudflare"
+model = "@cf/cloudflare/clairic"
