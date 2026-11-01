@@ -107,7 +107,7 @@ pub(crate) fn admit(method: &Method, path: &str) -> Admission {
     if let Some(route) = Route::recognize(method, path) {
         return Admission::Prepared(route);
     }
-    if prepared_near_miss(method, path) {
+    if prepared_near_miss(method, path) || dedicated_near_miss(path) {
         return Admission::Reject;
     }
     Admission::Native
@@ -128,7 +128,7 @@ fn local_route(path: &str) -> Option<LocalRoute> {
     if account_product(path) {
         return Some(LocalRoute::AccountProduct);
     }
-    if path == "/v1/capabilities" || path == "/v1/realtime" || path == "/session-events" {
+    if dedicated_path(path) {
         return Some(LocalRoute::Dedicated);
     }
     None
@@ -162,6 +162,26 @@ fn prepared_route(path: &str) -> Option<Route> {
         "/v1/audio/diarization" => Route::Audio(AudioKind::Diarization),
         _ => return clairic_account(path).map(|account| Route::Extraction { account }),
     })
+}
+
+const DEDICATED_PATHS: &[&str] = &["/v1/capabilities", "/v1/realtime", "/session-events"];
+
+fn dedicated_path(path: &str) -> bool {
+    DEDICATED_PATHS.contains(&path)
+}
+
+fn dedicated_near_miss(path: &str) -> bool {
+    let mut cursor = path;
+    while let Some((parent, _)) = cursor.rsplit_once('/') {
+        if parent.is_empty() {
+            break;
+        }
+        if dedicated_path(parent) {
+            return true;
+        }
+        cursor = parent;
+    }
+    false
 }
 
 fn prepared_near_miss(method: &Method, path: &str) -> bool {

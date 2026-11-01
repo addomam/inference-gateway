@@ -2880,7 +2880,11 @@ async fn near_miss_paths_do_not_reach_the_provider() -> Result<()> {
         .header("x-infer-key", &gateway.proxy_token)
         .send()
         .await?;
-    assert_eq!(response.status(), StatusCode::NOT_FOUND, "GET /v1/responses");
+    assert_eq!(
+        response.status(),
+        StatusCode::NOT_FOUND,
+        "GET /v1/responses"
+    );
     let session_events = gateway.post("/session-events/", &body).await?;
     assert_eq!(
         session_events.status(),
@@ -2921,7 +2925,11 @@ async fn near_miss_paths_do_not_reach_the_provider() -> Result<()> {
         .header("x-infer-key", &gateway.proxy_token)
         .send()
         .await?;
-    assert_eq!(realtime.status(), StatusCode::NOT_FOUND, "GET /v1/realtime/");
+    assert_eq!(
+        realtime.status(),
+        StatusCode::NOT_FOUND,
+        "GET /v1/realtime/"
+    );
     assert!(fixture.captured.try_recv().is_err());
 
     let served = gateway.post("/v1/chat/completions", &body).await?;
