@@ -29,9 +29,9 @@ From the inference-gateway repository root:
 python3 .cursor/skills/verify-trace-completion/check.py
 ```
 
-Exit 0 means the three functions still contain those steps in that order, every reachable state keeps the property, and the model reached a finished trace, a process crash, and a failed append. A pass that cannot reach those three is rejected so an empty model cannot pass.
+Exit 0 means every execution path through the three functions runs those steps in that order, every reachable state keeps the property, and the model reached a finished trace, a process crash, and a failed append. The check counts a closure when that closure runs. It counts `sync_all` only when the call is awaited. `self.failed = true` has to run before `write_all`. A pass that cannot reach those three is rejected so an empty model cannot pass.
 
-If `src/trace.rs` differs from the sync blob below, the command still exits 0 when the order matches, and it prints a notice. Re-read the three functions before trusting that pass. A notice means the file changed. It does not by itself mean the property failed.
+If `src/trace.rs` differs from the sync blob below, the command still exits 0 when execution order matches, and it prints a notice. Re-read the three functions before trusting that pass. A notice means the file changed. It does not by itself mean the property failed.
 
 These two commands must each exit 2 and print a violation. If either exits 0, the check can no longer fail:
 
@@ -44,9 +44,19 @@ python3 .cursor/skills/verify-trace-completion/check.py --broken finish-after-fa
 
 `finish-after-failed` is finish setting `complete = 1` after append has failed. The failure path sets `failed` and then marks the row complete.
 
+These three files must each exit 2. If one exits 0, marker order was accepted again.
+
+```sh
+python3 .cursor/skills/verify-trace-completion/check.py .cursor/skills/verify-trace-completion/fixtures/early-complete.rs
+python3 .cursor/skills/verify-trace-completion/check.py .cursor/skills/verify-trace-completion/fixtures/discard-sync.rs
+python3 .cursor/skills/verify-trace-completion/check.py .cursor/skills/verify-trace-completion/fixtures/failed-after-write.rs
+```
+
+`fixtures/early-complete.rs` executes `complete = 1` before `sync_all`. `fixtures/discard-sync.rs` drops `sync_all` without awaiting it. `fixtures/failed-after-write.rs` executes `write_all` before `self.failed = true`.
+
 ## Reading a result
 
-A source mismatch names `TraceStore::start`, `TraceWriter::append`, or `TraceWriter::finish` and the missing marker. Read that function. If the code still refuses a failed writer and still syncs bodies and both directories before the UPDATE, the model is stale: update the markers and the successor steps together, re-run the faithful command and both `--broken` commands, then move the sync commit. If the code now commits `complete = 1` earlier, or after `failed` is set, that is a finding in the product. Leave the finding in place. Do not delete a marker or weaken the property to make the command pass, and do not change product code unless the user asks.
+A source mismatch names `TraceStore::start`, `TraceWriter::append`, or `TraceWriter::finish` and the missing marker. Read that function. If the code still refuses a failed writer and still syncs bodies and both directories before the UPDATE, the model is stale: update the markers and the successor steps together, re-run the faithful command, both `--broken` commands, and the three fixture commands, then move the sync commit. If the code now commits `complete = 1` earlier, or after `failed` is set, that is a finding in the product. Leave the finding in place. Do not delete a marker or weaken the property to make the command pass, and do not change product code unless the user asks.
 
 A faithful-model failure prints steps in the words of those functions. Compare them with the function bodies. If the steps do not exist in the code, the successor list is a modeling error. If they do, the finding is the product order.
 
@@ -58,13 +68,13 @@ A faithful-model failure prints steps in the words of those functions. Compare t
 | `src/trace.rs` blob at that commit | `3ab27946e694e8ca98b7bfc99f2a529f0a6e91ad` |
 | Covered code | `TraceStore::start`, `TraceWriter::append`, `TraceWriter::finish` |
 
-The same commit and blob are `SYNC_COMMIT` and `TRACE_RS_BLOB` in `.cursor/skills/verify-trace-completion/check.py`. Move the skill values and the constants together. Move them only after you have re-read the three functions at the new commit, the faithful command passes, and both `--broken` commands still exit 2.
+The same commit and blob are `SYNC_COMMIT` and `TRACE_RS_BLOB` in `.cursor/skills/verify-trace-completion/check.py`. Move the skill values and the constants together. Move them only after you have re-read the three functions at the new commit, the faithful command passes, both `--broken` commands still exit 2, and the three fixture commands still exit 2.
 
-`git diff 41f05d49946908ad5fb800510713f7a95b8d95cd -- src/trace.rs` shows whether the covered file has changed. A change outside those three functions still deserves a reading of the diff, because the checker only anchors the markers above.
+`git diff 41f05d49946908ad5fb800510713f7a95b8d95cd -- src/trace.rs` shows whether the covered file has changed. A change outside those three functions still deserves a reading of the diff, because the checker only walks those effects.
 
 ## Bounds
 
-Checked: one writer lifetime; the incomplete insert before body files exist; crash instead of the next step; a failed append that must not finish; `sync_all`, the trace-id directory sync, and the trace-root directory sync before `complete = 1`.
+Checked: one writer lifetime; the incomplete insert before body files exist; crash instead of the next step; a failed append that must not finish; `sync_all`, the trace-id directory sync, and the trace-root directory sync before `complete = 1`. A `sync_all` that is not awaited fails the check. `write_all` before `self.failed = true` fails the check.
 
 Not checked: a second process, a second writer, Codex refresh, header redaction, export byte caps, or the SQLite pragma values. The code comment names WAL and `synchronous=FULL`. This checker does not re-prove those pragmas. It also does not require the converse. A crash after the syncs and before the UPDATE leaves the row incomplete, and that state is allowed.
 
