@@ -286,6 +286,7 @@ impl Config {
         client: catalog::Dialect,
     ) -> Result<ModelSelection<'_>> {
         if let Some(route) = self.models.get(model) {
+            self.require_target_dialect(route.provider.as_str(), client)?;
             return Ok(ModelSelection {
                 provider: route.provider.as_str(),
                 upstream_model: route.model.clone(),
@@ -357,6 +358,7 @@ impl Config {
             ),
             Err(error) => bail!("{error}"),
         }
+        self.require_target_dialect(self.default_provider.as_str(), client)?;
         Ok(ModelSelection {
             provider: self.default_provider.as_str(),
             upstream_model: model.to_owned(),
@@ -406,6 +408,16 @@ impl Config {
             operations_declared: true,
             modalities: hit.record.modalities.map(|items| items.to_vec()),
         })
+    }
+
+    fn require_target_dialect(&self, provider_name: &str, client: catalog::Dialect) -> Result<()> {
+        let dialects = self.providers[provider_name].kind.dialects();
+        if catalog::target_dialect(client, dialects).is_none() {
+            bail!(
+                "generation, embeddings, System One, OpenAI Decisions, and Clairic APIs cannot be translated; provider {provider_name} does not speak {client}"
+            );
+        }
+        Ok(())
     }
 }
 
