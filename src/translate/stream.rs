@@ -254,6 +254,7 @@ pub struct StreamTranslator {
     finish_reason: Option<String>,
     include_usage: bool,
     usage: Usage,
+    usage_known: bool,
 }
 impl StreamTranslator {
     pub fn new(from: Protocol, to: Protocol, model: String, include_usage: bool) -> Self {
@@ -285,6 +286,7 @@ impl StreamTranslator {
             finish_reason: None,
             include_usage,
             usage: Usage::default(),
+            usage_known: false,
         }
     }
     /// Distinguishes a cleanly framed provider error from a successful generation.
@@ -410,6 +412,9 @@ impl StreamTranslator {
     }
     fn start(&mut self, output: &mut Vec<Bytes>) {
         if self.started {
+            return;
+        }
+        if self.to == Protocol::Anthropic && !self.usage_known {
             return;
         }
         self.started = true;
@@ -896,7 +901,7 @@ impl StreamTranslator {
             bail!("duplicate block end");
         }
         if !block.text {
-            if block.args.is_empty() {
+            if self.from == Protocol::Anthropic && block.args.is_empty() {
                 self.tool_delta(key, "{}", output)?;
             }
             arguments(&self.blocks[key].args)?;
@@ -1129,6 +1134,13 @@ impl StreamTranslator {
                 if let Some(id) = v.pointer("/response/id").and_then(Value::as_str) {
                     self.id = id.into();
                 }
+                if let Some(usage) = v
+                    .pointer("/response/usage")
+                    .filter(|usage| !usage.is_null())
+                {
+                    self.usage = Usage::parse(usage, Protocol::Responses)?;
+                    self.usage_known = true;
+                }
                 self.start(output);
             }
             "response.in_progress" | "response.queued" => {}
@@ -1253,7 +1265,11 @@ impl StreamTranslator {
             "response.completed" | "response.incomplete" => {
                 let response = &v["response"];
                 validate_responses_terminal(response, kind)?;
-                self.usage = Usage::parse(&response["usage"], Protocol::Responses)?;
+                let usage = &response["usage"];
+                self.usage = Usage::parse(usage, Protocol::Responses)?;
+                if !usage.is_null() {
+                    self.usage_known = true;
+                }
                 let mut count = 0;
                 for (index, item) in response["output"]
                     .as_array()
@@ -1324,8 +1340,12 @@ impl StreamTranslator {
         {
             self.id = id.into();
         }
-        if let Some(usage) = v.get("usage").filter(|v| !v.is_null()) {
+        if let Some(usage) = v.get("usage").filter(|usage| !usage.is_null()) {
             self.usage = Usage::parse(usage, Protocol::Chat)?;
+            self.usage_known = true;
+            if self.to == Protocol::Anthropic {
+                self.start(output);
+            }
         }
         let choices = v["choices"]
             .as_array()
@@ -1457,6 +1477,7 @@ impl StreamTranslator {
                     self.id = id.into();
                 }
                 self.usage = Usage::parse(&v["message"]["usage"], Protocol::Anthropic)?;
+                self.usage_known = true;
                 if v["message"]["content"]
                     .as_array()
                     .is_some_and(|a| !a.is_empty())
