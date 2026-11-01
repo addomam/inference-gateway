@@ -2864,3 +2864,28 @@ async fn v01_codex_nonstream_responses_never_leak_sse_as_successful_json() -> Re
     );
     Ok(())
 }
+
+#[tokio::test]
+async fn near_miss_paths_do_not_reach_the_provider() -> Result<()> {
+    let mut fixture = Fixture::start(vec![json_reply(json!({"ok": true}))]).await?;
+    let gateway = Gateway::start("openai", &fixture.base, "upstream", None).await?;
+    let body = chat_request(false);
+    for path in ["/v1/chat/completions/", "/v1/messages/extra"] {
+        let response = gateway.post(path, &body).await?;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND, "{path}");
+    }
+    let response = gateway
+        .client
+        .get(format!("{}/v1/responses", gateway.base))
+        .header("x-infer-key", &gateway.proxy_token)
+        .send()
+        .await?;
+    assert_eq!(response.status(), StatusCode::NOT_FOUND, "GET /v1/responses");
+    assert!(fixture.captured.try_recv().is_err());
+
+    let served = gateway.post("/v1/chat/completions", &body).await?;
+    assert_eq!(served.status(), StatusCode::OK);
+    let captured = fixture.received().await?;
+    assert_eq!(captured.path, "/v1/chat/completions");
+    Ok(())
+}
