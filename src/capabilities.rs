@@ -1,6 +1,8 @@
 //! Machine-readable description of what this process can route. This is not an
 //! OpenAPI document. `/v1/models` remains the selected backend's own list.
 
+use std::collections::BTreeMap;
+
 use serde_json::{Value, json};
 
 use crate::{catalog, config::Config};
@@ -23,34 +25,40 @@ pub fn document(config: &Config) -> Value {
         .collect();
     let mut models = Vec::new();
     for (id, record) in catalog::listed() {
-        let Some(provider) = serving_provider(config, &record) else {
-            continue;
-        };
-        if let Some(program) = required_program(id, &record)
-            && !provider.1.daybreak.allows(program)
-        {
-            continue;
+        let mut groups: BTreeMap<&str, Vec<catalog::Dialect>> = BTreeMap::new();
+        for dialect in client_dialects() {
+            let Some((name, provider)) = serving_provider(config, id, *dialect) else {
+                continue;
+            };
+            if let Some(program) = required_program(id, &record)
+                && !provider.daybreak.allows(program)
+            {
+                continue;
+            }
+            groups.entry(name).or_default().push(*dialect);
         }
-        models.push(model_json(id, &record, provider.0, None));
-        if let Some(programs) = record.cyber {
+        for (name, dialects) in &groups {
+            let provider = &config.providers[*name];
+            models.push(model_json(id, &record, name, None, dialects));
+            let Some(programs) = record.cyber else {
+                continue;
+            };
             for program in programs {
-                if matches!(
-                    program,
-                    catalog::CyberProgram::DaybreakBlue | catalog::CyberProgram::DaybreakRed
-                ) && provider.1.daybreak.allows(program.as_str())
-                {
-                    let suffix = match program {
-                        catalog::CyberProgram::DaybreakBlue => "daybreak-blue",
-                        catalog::CyberProgram::DaybreakRed => "daybreak-red",
-                        catalog::CyberProgram::Standard => continue,
-                    };
-                    models.push(model_json(
-                        &format!("{id}#{suffix}"),
-                        &record,
-                        provider.0,
-                        Some(program.as_str()),
-                    ));
+                let suffix = match program {
+                    catalog::CyberProgram::DaybreakBlue => "daybreak-blue",
+                    catalog::CyberProgram::DaybreakRed => "daybreak-red",
+                    catalog::CyberProgram::Standard => continue,
+                };
+                if !provider.daybreak.allows(program.as_str()) {
+                    continue;
                 }
+                models.push(model_json(
+                    &format!("{id}#{suffix}"),
+                    &record,
+                    name,
+                    Some(program.as_str()),
+                    dialects,
+                ));
             }
         }
     }
@@ -87,23 +95,30 @@ fn routes() -> Vec<Value> {
     .collect()
 }
 
+fn client_dialects() -> &'static [catalog::Dialect] {
+    &[
+        catalog::Dialect::Chat,
+        catalog::Dialect::Responses,
+        catalog::Dialect::Messages,
+        catalog::Dialect::Decisions,
+        catalog::Dialect::SystemOne,
+        catalog::Dialect::Extraction,
+        catalog::Dialect::Embeddings,
+        catalog::Dialect::Transcription,
+        catalog::Dialect::Speech,
+        catalog::Dialect::Realtime,
+        catalog::Dialect::Diarization,
+    ]
+}
+
 fn serving_provider<'a>(
     config: &'a Config,
-    record: &catalog::ModelRecord,
+    id: &str,
+    dialect: catalog::Dialect,
 ) -> Option<(&'a str, &'a crate::config::Provider)> {
-    let mut matched = config.providers.iter().filter(|(_, provider)| {
-        record.dialects.iter().any(|dialect| {
-            catalog::target_dialect(*dialect, record.dialects).is_some_and(|target| {
-                record.families.contains(&provider.kind.family())
-                    && provider.kind.dialects().contains(&target)
-            })
-        })
-    });
-    let (name, provider) = matched.next()?;
-    matched
-        .next()
-        .is_none()
-        .then_some((name.as_str(), provider))
+    let name = config.resolve_model(id, dialect).ok()?.provider;
+    let provider = config.providers.get(name)?;
+    Some((name, provider))
 }
 
 fn required_program(id: &str, record: &catalog::ModelRecord) -> Option<&'static str> {
@@ -123,12 +138,13 @@ fn model_json(
     record: &catalog::ModelRecord,
     provider: &str,
     access_program: Option<&str>,
+    dialects: &[catalog::Dialect],
 ) -> Value {
     json!({
         "id": id,
         "provider": provider,
         "families": record.families.iter().copied().map(family_name).collect::<Vec<_>>(),
-        "dialects": record.dialects.iter().map(|dialect| dialect.as_str()).collect::<Vec<_>>(),
+        "dialects": dialects.iter().map(|dialect| dialect.as_str()).collect::<Vec<_>>(),
         "daybreak_programs": record.cyber.map(|programs| {
             programs.iter().map(|program| program.as_str()).collect::<Vec<_>>()
         }),
