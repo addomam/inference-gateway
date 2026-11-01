@@ -165,3 +165,92 @@ fn modality_name(modality: catalog::Modality) -> &'static str {
         catalog::Modality::Video => "video",
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeMap;
+
+    use crate::catalog;
+    use crate::config::Config;
+
+    use super::document;
+
+    const DIALECTS: [catalog::Dialect; 11] = [
+        catalog::Dialect::Chat,
+        catalog::Dialect::Responses,
+        catalog::Dialect::Messages,
+        catalog::Dialect::Decisions,
+        catalog::Dialect::SystemOne,
+        catalog::Dialect::Extraction,
+        catalog::Dialect::Embeddings,
+        catalog::Dialect::Transcription,
+        catalog::Dialect::Speech,
+        catalog::Dialect::Realtime,
+        catalog::Dialect::Diarization,
+    ];
+
+    fn example_without_chatgpt() -> Config {
+        let mut config: Config = toml::from_str(include_str!("../infer.example.toml")).unwrap();
+        config.providers.remove("chatgpt");
+        config
+    }
+
+    fn dialect_named(name: &str) -> catalog::Dialect {
+        DIALECTS
+            .into_iter()
+            .find(|dialect| dialect.as_str() == name)
+            .unwrap_or_else(|| panic!("unknown dialect {name}"))
+    }
+
+    fn listed_providers(document: &serde_json::Value, id: &str) -> BTreeMap<String, String> {
+        let mut listed = BTreeMap::new();
+        for model in document["models"].as_array().unwrap() {
+            if model["id"].as_str() != Some(id) {
+                continue;
+            }
+            let provider = model["provider"].as_str().unwrap().to_owned();
+            for dialect in model["dialects"].as_array().unwrap() {
+                let name = dialect.as_str().unwrap().to_owned();
+                let previous = listed.insert(name.clone(), provider.clone());
+                assert!(previous.is_none(), "{id} lists {name} under two providers");
+            }
+        }
+        listed
+    }
+
+    #[test]
+    fn listed_models_match_resolve_model() {
+        let config = example_without_chatgpt();
+        let document = document(&config);
+        for model in document["models"].as_array().unwrap() {
+            let id = model["id"].as_str().unwrap();
+            let provider = model["provider"].as_str().unwrap();
+            for dialect_name in model["dialects"].as_array().unwrap() {
+                let name = dialect_name.as_str().unwrap();
+                let dialect = dialect_named(name);
+                let resolved = config.resolve_model(id, dialect);
+                assert!(
+                    resolved
+                        .as_ref()
+                        .is_ok_and(|selection| selection.provider == provider),
+                    "{id} is listed for {name} under {provider}, resolve_model returned {resolved:?}"
+                );
+            }
+        }
+        let listed = listed_providers(&document, "gpt-6-luna");
+        for dialect in DIALECTS {
+            let name = dialect.as_str();
+            match config.resolve_model("gpt-6-luna", dialect) {
+                Ok(selection) => assert_eq!(
+                    listed.get(name).map(String::as_str),
+                    Some(selection.provider),
+                    "gpt-6-luna for {name}, listed {listed:?}"
+                ),
+                Err(error) => assert!(
+                    !listed.contains_key(name),
+                    "gpt-6-luna is listed for {name} but resolve_model returned no provider: {error}; listed {listed:?}"
+                ),
+            }
+        }
+    }
+}
