@@ -81,23 +81,115 @@ pub enum Route {
     Audio(AudioKind),
 }
 
+pub(crate) enum LocalRoute {
+    Uploads,
+    Files,
+    AccountProduct,
+    Dedicated,
+}
+
+pub(crate) enum Admission {
+    Local(LocalRoute),
+    Prepared(Route),
+    Native,
+    Reject,
+}
+
+const NATIVE_TOKEN_COUNT: &str = "/v1/messages/count_tokens";
+
+pub(crate) fn admit(method: &Method, path: &str) -> Admission {
+    if explicit_provider(path) {
+        return Admission::Native;
+    }
+    if let Some(local) = local_route(path) {
+        return Admission::Local(local);
+    }
+    if let Some(route) = Route::recognize(method, path) {
+        return Admission::Prepared(route);
+    }
+    if prepared_near_miss(method, path) {
+        return Admission::Reject;
+    }
+    Admission::Native
+}
+
+fn explicit_provider(path: &str) -> bool {
+    path.strip_prefix("/providers/")
+        .is_some_and(|rest| rest.split_once('/').is_some())
+}
+
+fn local_route(path: &str) -> Option<LocalRoute> {
+    if path == "/v1/uploads" || path.starts_with("/v1/uploads/") {
+        return Some(LocalRoute::Uploads);
+    }
+    if path == "/v1/files" || path.starts_with("/v1/files/") {
+        return Some(LocalRoute::Files);
+    }
+    if account_product(path) {
+        return Some(LocalRoute::AccountProduct);
+    }
+    if path == "/v1/capabilities" || path == "/v1/realtime" || path == "/session-events" {
+        return Some(LocalRoute::Dedicated);
+    }
+    None
+}
+
+fn account_product(path: &str) -> bool {
+    const FAMILIES: &[&str] = &[
+        "/v1/assistants",
+        "/v1/threads",
+        "/v1/batches",
+        "/v1/fine_tuning",
+        "/v1/fine-tunes",
+        "/v1/vector_stores",
+        "/v1/evals",
+    ];
+    FAMILIES
+        .iter()
+        .any(|family| path == *family || path.starts_with(&format!("{family}/")))
+}
+
+fn prepared_route(path: &str) -> Option<Route> {
+    Some(match path {
+        "/v1/messages" => Route::Generation(Protocol::Anthropic),
+        "/v1/chat/completions" => Route::Generation(Protocol::Chat),
+        "/v1/responses" => Route::Generation(Protocol::Responses),
+        "/v1/decisions" => Route::Decisions,
+        "/v1/systemone" => Route::SystemOne,
+        "/v1/embeddings" => Route::Embeddings,
+        "/v1/audio/speech" => Route::Audio(AudioKind::Speech),
+        "/v1/audio/transcriptions" => Route::Audio(AudioKind::Transcription),
+        "/v1/audio/diarization" => Route::Audio(AudioKind::Diarization),
+        _ => return clairic_account(path).map(|account| Route::Extraction { account }),
+    })
+}
+
+fn prepared_near_miss(method: &Method, path: &str) -> bool {
+    if path == NATIVE_TOKEN_COUNT {
+        return false;
+    }
+    if prepared_route(path).is_some() {
+        return method != Method::POST;
+    }
+    let mut cursor = path;
+    while let Some((parent, _)) = cursor.rsplit_once('/') {
+        if parent.is_empty() {
+            break;
+        }
+        if prepared_route(parent).is_some() {
+            return true;
+        }
+        cursor = parent;
+    }
+    false
+}
+
 impl Route {
     pub fn recognize(method: &Method, path: &str) -> Option<Self> {
         if method != Method::POST {
             return None;
         }
-        Some(match path {
-            "/v1/messages" => Self::Generation(Protocol::Anthropic),
-            "/v1/chat/completions" => Self::Generation(Protocol::Chat),
-            "/v1/responses" => Self::Generation(Protocol::Responses),
-            "/v1/decisions" => Self::Decisions,
-            "/v1/systemone" => Self::SystemOne,
-            "/v1/embeddings" => Self::Embeddings,
-            "/v1/audio/speech" => Self::Audio(AudioKind::Speech),
-            "/v1/audio/transcriptions" => Self::Audio(AudioKind::Transcription),
-            "/v1/audio/diarization" => Self::Audio(AudioKind::Diarization),
-            _ => return clairic_account(path).map(|account| Self::Extraction { account }),
-        })
+        prepared_route(path)
     }
 
     pub fn client_dialect(&self) -> Dialect {
