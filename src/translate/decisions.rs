@@ -752,5 +752,23 @@ mod tests {
             ),
             (Some("predicate"), spelling.to_owned(), expected_rows)
         );
+
+        let (_, reverse_plan) = from_system_one(&json!({
+            "state": "Inspect",
+            "questions": {
+                "damaged": {"type": "noul", "instructions": "Is it damaged?"}
+            }
+        }))
+        .unwrap();
+        let decisions = serde_json::from_str::<Value>(&format!(
+            r#"{{
+                "answers": [
+                    {{"name": "damaged", "type": "predicate", "probability": {spelling}}}
+                ]
+            }}"#
+        ))
+        .unwrap();
+        let reversed = to_system_one(decisions, &reverse_plan).unwrap();
+        assert_eq!(reversed["answers"]["damaged"]["noul"].to_string(), spelling);
     }
 }
