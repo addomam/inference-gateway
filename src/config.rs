@@ -549,6 +549,50 @@ mod tests {
     }
 
     #[test]
+    fn alias_must_speak_the_client_dialect() {
+        let raw = "\
+proxy_token_env = \"INFER_PROXY_TOKEN\"
+control_token_env = \"INFER_CONTROL_TOKEN\"
+default_provider = \"openai_decisions\"
+[providers.openai_decisions]
+kind = \"openai_decisions\"
+base_url = \"https://api.openai.com\"
+[models.luna]
+provider = \"openai_decisions\"
+model = \"gpt-6-luna\"
+";
+        let config: Config = toml::from_str(raw).unwrap();
+        config.validate().unwrap();
+
+        let decisions = config
+            .resolve_model("luna", catalog::Dialect::Decisions)
+            .unwrap();
+        assert_eq!(decisions.provider, "openai_decisions");
+        assert_eq!(decisions.upstream_model, "gpt-6-luna");
+
+        let chat = config.resolve_model("luna", catalog::Dialect::Chat);
+        let fallback = config.resolve_model("missing-model", catalog::Dialect::Chat);
+        assert!(
+            chat.as_ref().is_err_and(|error| {
+                let message = error.to_string();
+                message.contains("cannot be translated")
+                    && message.contains("does not speak chat")
+                    && message.contains("openai_decisions")
+            }),
+            "alias luna on chat selected {chat:?}"
+        );
+        assert!(
+            fallback.as_ref().is_err_and(|error| {
+                let message = error.to_string();
+                message.contains("cannot be translated")
+                    && message.contains("does not speak chat")
+                    && message.contains("openai_decisions")
+            }),
+            "default provider on chat selected {fallback:?}"
+        );
+    }
+
+    #[test]
     fn duplicate_namespace_for_one_capability_is_rejected() {
         let raw = "\
 proxy_token_env = \"INFER_PROXY_TOKEN\"
