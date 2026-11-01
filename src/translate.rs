@@ -873,6 +873,156 @@ mod tests {
             input
         );
     }
+    fn sse_text(parts: Vec<bytes::Bytes>) -> String {
+        parts
+            .into_iter()
+            .map(|part| String::from_utf8(part.to_vec()).unwrap())
+            .collect()
+    }
+    fn sse_values(parts: Vec<bytes::Bytes>) -> Vec<Value> {
+        sse_text(parts)
+            .split("\n\n")
+            .filter_map(|frame| {
+                let data = frame.lines().find_map(|line| line.strip_prefix("data: "))?;
+                if data == "[DONE]" {
+                    return None;
+                }
+                Some(serde_json::from_str(data).unwrap())
+            })
+            .collect()
+    }
+    #[test]
+    fn empty_tool_arguments_fail_on_buffer_and_stream() {
+        let chat = json!({"choices":[{"finish_reason":"tool_calls","message":{"role":"assistant","content":null,"tool_calls":[{"id":"call_a","type":"function","function":{"name":"lookup","arguments":""}}]}}],"usage":{}});
+        let buffered = response(chat, Protocol::Chat, Protocol::Anthropic, "x")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            buffered.contains("tool arguments must be valid JSON"),
+            "{buffered}"
+        );
+
+        let responses = json!({"id":"r","status":"completed","output":[{"type":"function_call","call_id":"call_a","name":"lookup","arguments":""}],"usage":{}});
+        let buffered_responses = response(responses, Protocol::Responses, Protocol::Chat, "x")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            buffered_responses.contains("tool arguments must be valid JSON"),
+            "{buffered_responses}"
+        );
+
+        let mut chat_stream =
+            StreamTranslator::new(Protocol::Chat, Protocol::Anthropic, "x".into(), true);
+        let header = chat_stream
+            .push(
+                format!(
+                    "data: {}\n\n",
+                    json!({"choices":[{"index":0,"delta":{"role":"assistant","tool_calls":[{"index":0,"id":"call_a","type":"function","function":{"name":"lookup","arguments":""}}]},"finish_reason":null}]})
+                )
+                .as_bytes(),
+            )
+            .unwrap();
+        assert!(!sse_text(header).contains("[DONE]"));
+        chat_stream
+            .push(
+                format!(
+                    "data: {}\n\n",
+                    json!({"choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]})
+                )
+                .as_bytes(),
+            )
+            .unwrap();
+        match chat_stream.push(b"data: [DONE]\n\n") {
+            Ok(parts) => panic!("streamed empty arguments completed: {}", sse_text(parts)),
+            Err(error) => {
+                let streamed = error.to_string();
+                assert!(
+                    streamed.contains("tool arguments must be valid JSON"),
+                    "{streamed}"
+                );
+                assert!(!streamed.contains("[DONE]"), "{streamed}");
+            }
+        }
+
+        let call =
+            json!({"type":"function_call","call_id":"call_a","name":"lookup","arguments":""});
+        let mut responses_stream =
+            StreamTranslator::new(Protocol::Responses, Protocol::Chat, "x".into(), true);
+        let completed = format!(
+            "event: response.completed\ndata: {}\n\n",
+            json!({"type":"response.completed","response":{"status":"completed","output":[call],"usage":{"input_tokens":1,"output_tokens":1}}})
+        );
+        match responses_stream.push(completed.as_bytes()) {
+            Ok(parts) => panic!("streamed empty arguments completed: {}", sse_text(parts)),
+            Err(error) => {
+                let streamed = error.to_string();
+                assert!(
+                    streamed.contains("tool arguments must be valid JSON"),
+                    "{streamed}"
+                );
+                assert!(!streamed.contains("[DONE]"), "{streamed}");
+            }
+        }
+    }
+    #[test]
+    fn anthropic_message_start_carries_known_usage() {
+        let mut chat = StreamTranslator::new(Protocol::Chat, Protocol::Anthropic, "x".into(), true);
+        let mut parts = chat
+            .push(
+                format!(
+                    "data: {}\n\n",
+                    json!({"id":"c","choices":[{"index":0,"delta":{"role":"assistant","content":"hi"},"finish_reason":null}]})
+                )
+                .as_bytes(),
+            )
+            .unwrap();
+        parts.extend(
+            chat.push(
+                format!(
+                    "data: {}\n\n",
+                    json!({"choices":[],"usage":{"prompt_tokens":9,"completion_tokens":2,"prompt_tokens_details":{"cached_tokens":4}}})
+                )
+                .as_bytes(),
+            )
+            .unwrap(),
+        );
+        let chat_start = sse_values(parts)
+            .into_iter()
+            .find(|event| event["type"] == "message_start")
+            .unwrap_or(Value::Null);
+        assert_eq!(
+            chat_start["message"]["usage"]["input_tokens"], 5,
+            "{chat_start}"
+        );
+        assert_eq!(
+            chat_start["message"]["usage"]["cache_read_input_tokens"], 4,
+            "{chat_start}"
+        );
+
+        let mut created =
+            StreamTranslator::new(Protocol::Responses, Protocol::Anthropic, "x".into(), true);
+        let created_parts = created
+            .push(
+                format!(
+                    "event: response.created\ndata: {}\n\n",
+                    json!({"type":"response.created","response":{"id":"r","usage":{"input_tokens":9,"output_tokens":0,"input_tokens_details":{"cached_tokens":4}}}})
+                )
+                .as_bytes(),
+            )
+            .unwrap();
+        let created_start = sse_values(created_parts)
+            .into_iter()
+            .find(|event| event["type"] == "message_start")
+            .unwrap_or(Value::Null);
+        assert_eq!(
+            created_start["message"]["usage"]["input_tokens"], 5,
+            "{created_start}"
+        );
+        assert_eq!(
+            created_start["message"]["usage"]["cache_read_input_tokens"], 4,
+            "{created_start}"
+        );
+    }
     #[test]
     fn refusal_and_truncated_json_are_explicit() {
         let input = json!({"id":"r","status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"refusal","refusal":"cannot comply"}]}],"usage":{}});
