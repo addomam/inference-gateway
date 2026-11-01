@@ -448,10 +448,11 @@ pub fn to_system_one(body: Value, plan: &SystemOnePlan) -> Result<Value> {
             ReverseKind::Noul => {
                 let probability = answer
                     .get("probability")
-                    .and_then(Value::as_f64)
+                    .filter(|value| value.is_number())
+                    .cloned()
                     .context_msg("Decisions predicate answer missing probability")?;
                 out.insert("type".into(), Value::String("noul".into()));
-                out.insert("noul".into(), json!(probability));
+                out.insert("noul".into(), probability);
             }
             ReverseKind::Choice(keys) => {
                 let choice = answer
