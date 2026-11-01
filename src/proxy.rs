@@ -340,6 +340,7 @@ fn filtered_headers(headers: &HeaderMap, request: bool) -> HeaderMap {
                     "host"
                         | "authorization"
                         | "x-api-key"
+                        | "api-key"
                         | "x-infer-key"
                         | "cookie"
                         | "forwarded"
