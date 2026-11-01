@@ -680,4 +680,75 @@ mod tests {
         assert_eq!(translated["answers"]["route"]["choice"], "ship");
         assert!(from_system_one(&json!({"model":"x","state":{"a":1},"questions":{"q":{"type":"noul","instructions":"?"}}})).is_err());
     }
+
+    #[test]
+    fn noul_spelling_survives_and_score_levels_keep_request_order() {
+        let spelling = "0.123456789012345678901234567890";
+        let mut levels = Vec::new();
+        for index in 0..=10 {
+            levels.push(json!({ "label": format!("L{index}") }));
+        }
+        let input = json!({
+            "model": "kev",
+            "input": "Inspect",
+            "questions": [
+                {"type": "predicate", "instructions": "Is it damaged?"},
+                {
+                    "type": "score",
+                    "name": "priority",
+                    "instructions": "Rate",
+                    "levels": levels
+                }
+            ]
+        });
+        let (_, plan) = request(&input).unwrap();
+        let upstream = serde_json::from_str::<Value>(&format!(
+            r#"{{
+                "answers": {{
+                    "q0": {{"type": "noul", "noul": {spelling}}},
+                    "priority": {{
+                        "type": "score",
+                        "score": 1,
+                        "probabilities": {{
+                            "0": 0,
+                            "1": 1,
+                            "2": 2,
+                            "3": 3,
+                            "4": 4,
+                            "5": 5,
+                            "6": 6,
+                            "7": 7,
+                            "8": 8,
+                            "9": 9,
+                            "10": 10
+                        }}
+                    }}
+                }}
+            }}"#
+        ))
+        .unwrap();
+        let translated = response(upstream, &plan).unwrap();
+        let rows = translated["answers"][1]["probabilities"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|item| {
+                (
+                    item["label"].as_str().unwrap().to_owned(),
+                    item["probability"].to_string(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let expected_rows = (0..=10)
+            .map(|index| (format!("L{index}"), index.to_string()))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            (
+                translated["answers"][0]["type"].as_str(),
+                translated["answers"][0]["probability"].to_string(),
+                rows,
+            ),
+            (Some("predicate"), spelling.to_owned(), expected_rows)
+        );
+    }
 }
