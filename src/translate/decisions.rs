@@ -221,12 +221,13 @@ pub fn response(body: Value, plan: &DecisionPlan) -> Result<Value> {
         );
         match &question.kind {
             QuestionKind::Predicate => {
-                let probability = answer
+                let noul = answer
                     .get("noul")
-                    .and_then(Value::as_f64)
+                    .filter(|value| value.is_number())
+                    .cloned()
                     .context_msg("System One noul answer missing noul")?;
                 out.insert("type".into(), Value::String("predicate".into()));
-                out.insert("probability".into(), json!(probability));
+                out.insert("probability".into(), noul);
             }
             QuestionKind::Choice(values) => {
                 let choice = answer
@@ -266,7 +267,7 @@ pub fn response(body: Value, plan: &DecisionPlan) -> Result<Value> {
                 }
                 if let Some(probabilities) = answer.get("probabilities").and_then(Value::as_object)
                 {
-                    let mut items = Vec::new();
+                    let mut ranked: Vec<Option<Value>> = vec![None; levels.len()];
                     for (key, probability) in probabilities {
                         let index: usize = key.parse().with_context(|| {
                             format!("System One score probability {key} is not an index")
@@ -274,12 +275,13 @@ pub fn response(body: Value, plan: &DecisionPlan) -> Result<Value> {
                         let level = levels.get(index).with_context(|| {
                             format!("System One score probability {key} was not requested")
                         })?;
-                        items.push(json!({
+                        ranked[index] = Some(json!({
                             "label": level.label,
                             "value": level.value,
                             "probability": probability
                         }));
                     }
+                    let items = ranked.into_iter().flatten().collect();
                     out.insert("probabilities".into(), Value::Array(items));
                 }
             }
