@@ -481,6 +481,55 @@ async fn raw_gateway_token_is_not_forwarded_as_authorization() -> Result<()> {
 }
 
 #[tokio::test]
+async fn routed_chat_does_not_forward_client_api_key() -> Result<()> {
+    let mut fixture = Fixture::start(vec![Reply {
+        status: StatusCode::OK,
+        content_type: Some("application/json"),
+        chunks: vec![serde_json::to_vec(&json!({
+            "id": "c",
+            "choices": [{"message": {"role": "assistant", "content": "ok"}}]
+        }))?],
+        headers: vec![("api-key", "upstream-response-key")],
+        gates: None,
+    }])
+    .await?;
+    let gateway = Gateway::start_with_provider_auth(
+        "openai",
+        &fixture.base,
+        "upstream",
+        "bearer",
+        Some("configured-provider-secret"),
+    )
+    .await?;
+    let response = gateway
+        .client
+        .post(format!("{}/v1/chat/completions", gateway.base))
+        .header("x-infer-key", &gateway.proxy_token)
+        .header("api-key", "client-secret")
+        .header("x-api-key", "client-x-key")
+        .json(&chat_request(false))
+        .send()
+        .await?;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.headers()["api-key"], "upstream-response-key");
+    response.bytes().await?;
+    let captured = fixture.received().await?;
+    assert!(
+        captured.headers.get("api-key").is_none(),
+        "upstream request forwarded client api-key"
+    );
+    assert!(
+        captured.headers.get("x-api-key").is_none(),
+        "configured bearer route forwarded client x-api-key"
+    );
+    assert_eq!(
+        captured.headers["authorization"],
+        "Bearer configured-provider-secret"
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn google_api_key_headers_are_forwarded_but_redacted_at_every_trace_boundary() -> Result<()> {
     let reply = Reply {
         status: StatusCode::OK,

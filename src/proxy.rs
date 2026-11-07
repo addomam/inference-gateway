@@ -354,6 +354,7 @@ fn filtered_headers(headers: &HeaderMap, request: bool) -> HeaderMap {
                     "host"
                         | "authorization"
                         | "x-api-key"
+                        | "api-key"
                         | "x-infer-key"
                         | "cookie"
                         | "forwarded"
@@ -3112,6 +3113,45 @@ mod tests {
                     .any(|bytes| bytes == key.as_bytes())
             }));
         }
+    }
+
+    #[tokio::test]
+    async fn routed_requests_drop_api_key_and_passthrough_keeps_x_api_key() {
+        let mut incoming = HeaderMap::new();
+        incoming.insert("api-key", HeaderValue::from_static("client-secret"));
+        incoming.insert("x-api-key", HeaderValue::from_static("client-x-key"));
+        incoming.insert(
+            "authorization",
+            HeaderValue::from_static("Bearer client-token"),
+        );
+        incoming.insert("accept", HeaderValue::from_static("application/json"));
+
+        let routed = filtered_headers(&incoming, true);
+        assert!(
+            routed.get("api-key").is_none(),
+            "routed request still contains api-key: {:?}",
+            routed.get("api-key").and_then(|value| value.to_str().ok())
+        );
+        assert_eq!(routed["accept"], "application/json");
+        assert_eq!(
+            filtered_headers(&incoming, false)["api-key"],
+            "client-secret",
+            "response filtering must keep api-key"
+        );
+
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let passthrough = ProviderAuth::new(crate::auth::AuthConfig {
+            mode: "passthrough".into(),
+            ..crate::auth::AuthConfig::default()
+        })
+        .unwrap();
+        let forwarded = passthrough
+            .headers(&client, false, &incoming)
+            .await
+            .unwrap();
+        assert_eq!(forwarded["x-api-key"], "client-x-key");
+        assert_eq!(forwarded["authorization"], "Bearer client-token");
+        assert!(forwarded.get("api-key").is_none());
     }
 
     #[test]

@@ -298,7 +298,7 @@ infer does not fetch image URLs, resize assets, validate Cloudflare's field sche
 
 ### Authentication and subscriptions
 
-Gateway authentication accepts `x-infer-key`, `Authorization: Bearer`, or `x-api-key`, in that precedence. Inference and control tokens must differ. These credentials are never forwarded as upstream credentials.
+Gateway authentication accepts `x-infer-key`, `Authorization: Bearer`, or `x-api-key`, in that precedence. Inference and control tokens must differ. These credentials are never forwarded as upstream credentials. The client header `api-key` is removed from every upstream request, including passthrough. Passthrough forwards only `Authorization` and `x-api-key`.
 
 Provider `auth.mode`:
 
