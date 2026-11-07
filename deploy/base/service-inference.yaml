@@ -1,0 +1,15 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: infer
+  labels:
+    app.kubernetes.io/name: infer
+    app.kubernetes.io/component: inference
+spec:
+  selector:
+    app.kubernetes.io/name: infer
+    app.kubernetes.io/component: gateway
+  ports:
+    - name: http
+      port: 8080
+      targetPort: http

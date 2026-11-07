@@ -37,6 +37,11 @@ enum Command {
     Check,
     /// Run inference and control HTTP listeners (the default).
     Serve,
+    /// GET the control listener's `/health` with the control token.
+    ///
+    /// Does not follow redirects or use `HTTP_PROXY`. Exit status is 0 only
+    /// when the control listener returns HTTP 2xx.
+    Probe,
     /// Import an OMP event spool; identical events already stored are skipped.
     ImportEvents {
         /// JSONL spool file written by the infer OMP extension.
@@ -152,6 +157,7 @@ async fn main() -> anyhow::Result<()> {
             println!("configuration valid");
             Ok(())
         }
+        Command::Probe => proxy::probe(&config).await,
         Command::Serve => proxy::serve(config).await,
         Command::ImportEvents { file } => {
             let file = tokio::fs::File::open(file)

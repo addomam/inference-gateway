@@ -1,0 +1,26 @@
+name: image
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  smoke:
+    name: kind smoke
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install kind and kubectl
+        run: |
+          curl -fsSL -o /tmp/kind https://kind.sigs.k8s.io/dl/v0.33.0/kind-linux-amd64
+          install -m 0755 /tmp/kind /usr/local/bin/kind
+          curl -fsSL -o /tmp/kubectl https://dl.k8s.io/release/v1.32.2/bin/linux/amd64/kubectl
+          install -m 0755 /tmp/kubectl /usr/local/bin/kubectl
+          kind version
+          kubectl version --client
+      - name: Build the image and smoke-test it
+        run: bash deploy/e2e/smoke.sh

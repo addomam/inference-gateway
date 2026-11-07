@@ -1,0 +1,14 @@
+listen = "0.0.0.0:8080"
+control_listen = "0.0.0.0:8081"
+proxy_token_env = "INFER_PROXY_TOKEN"
+control_token_env = "INFER_CONTROL_TOKEN"
+trace_dir = "/var/lib/infer"
+default_provider = "upstream"
+connect_timeout_seconds = 5
+read_timeout_seconds = 30
+
+[providers.upstream]
+kind = "openai"
+base_url = "http://stub:8080"
+[providers.upstream.auth]
+mode = "none"

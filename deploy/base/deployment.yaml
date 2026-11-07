@@ -1,0 +1,120 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: infer
+  labels:
+    app.kubernetes.io/name: infer
+    app.kubernetes.io/component: gateway
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: infer
+      app.kubernetes.io/component: gateway
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: infer
+        app.kubernetes.io/component: gateway
+    spec:
+      automountServiceAccountToken: false
+      terminationGracePeriodSeconds: 40
+      securityContext:
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+        fsGroupChangePolicy: OnRootMismatch
+        seccompProfile:
+          type: RuntimeDefault
+      initContainers:
+        - name: own-traces
+          image: busybox:1.37.0
+          imagePullPolicy: IfNotPresent
+          command: ["chown", "65532:65532", "/var/lib/infer"]
+          securityContext:
+            runAsUser: 0
+            runAsNonRoot: false
+            readOnlyRootFilesystem: true
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+              add: ["CHOWN"]
+          volumeMounts:
+            - name: traces
+              mountPath: /var/lib/infer
+      containers:
+        - name: infer
+          image: infer:local
+          imagePullPolicy: IfNotPresent
+          args: ["--config", "/etc/infer/infer.toml", "serve"]
+          ports:
+            - name: http
+              containerPort: 8080
+            - name: control
+              containerPort: 8081
+          env:
+            - name: INFER_PROXY_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: infer-credentials
+                  key: proxy-token
+            - name: INFER_CONTROL_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: infer-credentials
+                  key: control-token
+            - name: UPSTREAM_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: infer-credentials
+                  key: upstream-token
+          readinessProbe:
+            exec:
+              command: ["/infer", "--config", "/etc/infer/infer.toml", "probe"]
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+          livenessProbe:
+            exec:
+              command: ["/infer", "--config", "/etc/infer/infer.toml", "probe"]
+            periodSeconds: 20
+            timeoutSeconds: 5
+            failureThreshold: 3
+          startupProbe:
+            exec:
+              command: ["/infer", "--config", "/etc/infer/infer.toml", "probe"]
+            periodSeconds: 2
+            timeoutSeconds: 5
+            failureThreshold: 30
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              cpu: "1"
+              memory: 1Gi
+          securityContext:
+            runAsNonRoot: true
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: config
+              mountPath: /etc/infer
+              readOnly: true
+            - name: traces
+              mountPath: /var/lib/infer
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: config
+          configMap:
+            name: infer-config
+        - name: traces
+          persistentVolumeClaim:
+            claimName: infer-traces
+        - name: tmp
+          emptyDir: {}
