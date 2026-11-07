@@ -221,12 +221,13 @@ pub fn response(body: Value, plan: &DecisionPlan) -> Result<Value> {
         );
         match &question.kind {
             QuestionKind::Predicate => {
-                let probability = answer
+                let noul = answer
                     .get("noul")
-                    .and_then(Value::as_f64)
+                    .filter(|value| value.is_number())
+                    .cloned()
                     .context_msg("System One noul answer missing noul")?;
                 out.insert("type".into(), Value::String("predicate".into()));
-                out.insert("probability".into(), json!(probability));
+                out.insert("probability".into(), noul);
             }
             QuestionKind::Choice(values) => {
                 let choice = answer
@@ -266,7 +267,7 @@ pub fn response(body: Value, plan: &DecisionPlan) -> Result<Value> {
                 }
                 if let Some(probabilities) = answer.get("probabilities").and_then(Value::as_object)
                 {
-                    let mut items = Vec::new();
+                    let mut ranked: Vec<Option<Value>> = vec![None; levels.len()];
                     for (key, probability) in probabilities {
                         let index: usize = key.parse().with_context(|| {
                             format!("System One score probability {key} is not an index")
@@ -274,12 +275,13 @@ pub fn response(body: Value, plan: &DecisionPlan) -> Result<Value> {
                         let level = levels.get(index).with_context(|| {
                             format!("System One score probability {key} was not requested")
                         })?;
-                        items.push(json!({
+                        ranked[index] = Some(json!({
                             "label": level.label,
                             "value": level.value,
                             "probability": probability
                         }));
                     }
+                    let items = ranked.into_iter().flatten().collect();
                     out.insert("probabilities".into(), Value::Array(items));
                 }
             }
@@ -446,10 +448,11 @@ pub fn to_system_one(body: Value, plan: &SystemOnePlan) -> Result<Value> {
             ReverseKind::Noul => {
                 let probability = answer
                     .get("probability")
-                    .and_then(Value::as_f64)
+                    .filter(|value| value.is_number())
+                    .cloned()
                     .context_msg("Decisions predicate answer missing probability")?;
                 out.insert("type".into(), Value::String("noul".into()));
-                out.insert("noul".into(), json!(probability));
+                out.insert("noul".into(), probability);
             }
             ReverseKind::Choice(keys) => {
                 let choice = answer
@@ -679,5 +682,94 @@ mod tests {
         assert_eq!(translated["answers"]["damaged"]["noul"], 0.2);
         assert_eq!(translated["answers"]["route"]["choice"], "ship");
         assert!(from_system_one(&json!({"model":"x","state":{"a":1},"questions":{"q":{"type":"noul","instructions":"?"}}})).is_err());
+    }
+
+    #[test]
+    fn noul_spelling_survives_and_score_levels_keep_request_order() {
+        let spelling = "0.123456789012345678901234567890";
+        let mut levels = Vec::new();
+        for index in 0..=10 {
+            levels.push(json!({ "label": format!("L{index}") }));
+        }
+        let input = json!({
+            "model": "kev",
+            "input": "Inspect",
+            "questions": [
+                {"type": "predicate", "instructions": "Is it damaged?"},
+                {
+                    "type": "score",
+                    "name": "priority",
+                    "instructions": "Rate",
+                    "levels": levels
+                }
+            ]
+        });
+        let (_, plan) = request(&input).unwrap();
+        let upstream = serde_json::from_str::<Value>(&format!(
+            r#"{{
+                "answers": {{
+                    "q0": {{"type": "noul", "noul": {spelling}}},
+                    "priority": {{
+                        "type": "score",
+                        "score": 1,
+                        "probabilities": {{
+                            "0": 0,
+                            "1": 1,
+                            "2": 2,
+                            "3": 3,
+                            "4": 4,
+                            "5": 5,
+                            "6": 6,
+                            "7": 7,
+                            "8": 8,
+                            "9": 9,
+                            "10": 10
+                        }}
+                    }}
+                }}
+            }}"#
+        ))
+        .unwrap();
+        let translated = response(upstream, &plan).unwrap();
+        let rows = translated["answers"][1]["probabilities"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|item| {
+                (
+                    item["label"].as_str().unwrap().to_owned(),
+                    item["probability"].to_string(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let expected_rows = (0..=10)
+            .map(|index| (format!("L{index}"), index.to_string()))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            (
+                translated["answers"][0]["type"].as_str(),
+                translated["answers"][0]["probability"].to_string(),
+                rows,
+            ),
+            (Some("predicate"), spelling.to_owned(), expected_rows)
+        );
+
+        let (_, reverse_plan) = from_system_one(&json!({
+            "state": "Inspect",
+            "questions": {
+                "damaged": {"type": "noul", "instructions": "Is it damaged?"}
+            }
+        }))
+        .unwrap();
+        let decisions = serde_json::from_str::<Value>(&format!(
+            r#"{{
+                "answers": [
+                    {{"name": "damaged", "type": "predicate", "probability": {spelling}}}
+                ]
+            }}"#
+        ))
+        .unwrap();
+        let reversed = to_system_one(decisions, &reverse_plan).unwrap();
+        assert_eq!(reversed["answers"]["damaged"]["noul"].to_string(), spelling);
     }
 }
