@@ -1,6 +1,8 @@
 //! Machine-readable description of what this process can route. This is not an
 //! OpenAPI document. `/v1/models` remains the selected backend's own list.
 
+use std::collections::BTreeMap;
+
 use serde_json::{Value, json};
 
 use crate::{catalog, config::Config};
@@ -23,34 +25,40 @@ pub fn document(config: &Config) -> Value {
         .collect();
     let mut models = Vec::new();
     for (id, record) in catalog::listed() {
-        let Some(provider) = serving_provider(config, &record) else {
-            continue;
-        };
-        if let Some(program) = required_program(id, &record)
-            && !provider.1.daybreak.allows(program)
-        {
-            continue;
+        let mut groups: BTreeMap<&str, Vec<catalog::Dialect>> = BTreeMap::new();
+        for dialect in client_dialects() {
+            let Some((name, provider)) = serving_provider(config, id, *dialect) else {
+                continue;
+            };
+            if let Some(program) = required_program(id, &record)
+                && !provider.daybreak.allows(program)
+            {
+                continue;
+            }
+            groups.entry(name).or_default().push(*dialect);
         }
-        models.push(model_json(id, &record, provider.0, None));
-        if let Some(programs) = record.cyber {
+        for (name, dialects) in &groups {
+            let provider = &config.providers[*name];
+            models.push(model_json(id, &record, name, None, dialects));
+            let Some(programs) = record.cyber else {
+                continue;
+            };
             for program in programs {
-                if matches!(
-                    program,
-                    catalog::CyberProgram::DaybreakBlue | catalog::CyberProgram::DaybreakRed
-                ) && provider.1.daybreak.allows(program.as_str())
-                {
-                    let suffix = match program {
-                        catalog::CyberProgram::DaybreakBlue => "daybreak-blue",
-                        catalog::CyberProgram::DaybreakRed => "daybreak-red",
-                        catalog::CyberProgram::Standard => continue,
-                    };
-                    models.push(model_json(
-                        &format!("{id}#{suffix}"),
-                        &record,
-                        provider.0,
-                        Some(program.as_str()),
-                    ));
+                let suffix = match program {
+                    catalog::CyberProgram::DaybreakBlue => "daybreak-blue",
+                    catalog::CyberProgram::DaybreakRed => "daybreak-red",
+                    catalog::CyberProgram::Standard => continue,
+                };
+                if !provider.daybreak.allows(program.as_str()) {
+                    continue;
                 }
+                models.push(model_json(
+                    &format!("{id}#{suffix}"),
+                    &record,
+                    name,
+                    Some(program.as_str()),
+                    dialects,
+                ));
             }
         }
     }
@@ -87,23 +95,30 @@ fn routes() -> Vec<Value> {
     .collect()
 }
 
+fn client_dialects() -> &'static [catalog::Dialect] {
+    &[
+        catalog::Dialect::Chat,
+        catalog::Dialect::Responses,
+        catalog::Dialect::Messages,
+        catalog::Dialect::Decisions,
+        catalog::Dialect::SystemOne,
+        catalog::Dialect::Extraction,
+        catalog::Dialect::Embeddings,
+        catalog::Dialect::Transcription,
+        catalog::Dialect::Speech,
+        catalog::Dialect::Realtime,
+        catalog::Dialect::Diarization,
+    ]
+}
+
 fn serving_provider<'a>(
     config: &'a Config,
-    record: &catalog::ModelRecord,
+    id: &str,
+    dialect: catalog::Dialect,
 ) -> Option<(&'a str, &'a crate::config::Provider)> {
-    let mut matched = config.providers.iter().filter(|(_, provider)| {
-        record.dialects.iter().any(|dialect| {
-            catalog::target_dialect(*dialect, record.dialects).is_some_and(|target| {
-                record.families.contains(&provider.kind.family())
-                    && provider.kind.dialects().contains(&target)
-            })
-        })
-    });
-    let (name, provider) = matched.next()?;
-    matched
-        .next()
-        .is_none()
-        .then_some((name.as_str(), provider))
+    let name = config.resolve_model(id, dialect).ok()?.provider;
+    let provider = config.providers.get(name)?;
+    Some((name, provider))
 }
 
 fn required_program(id: &str, record: &catalog::ModelRecord) -> Option<&'static str> {
@@ -123,12 +138,13 @@ fn model_json(
     record: &catalog::ModelRecord,
     provider: &str,
     access_program: Option<&str>,
+    dialects: &[catalog::Dialect],
 ) -> Value {
     json!({
         "id": id,
         "provider": provider,
         "families": record.families.iter().copied().map(family_name).collect::<Vec<_>>(),
-        "dialects": record.dialects.iter().map(|dialect| dialect.as_str()).collect::<Vec<_>>(),
+        "dialects": dialects.iter().map(|dialect| dialect.as_str()).collect::<Vec<_>>(),
         "daybreak_programs": record.cyber.map(|programs| {
             programs.iter().map(|program| program.as_str()).collect::<Vec<_>>()
         }),
@@ -163,5 +179,94 @@ fn modality_name(modality: catalog::Modality) -> &'static str {
         catalog::Modality::Image => "image",
         catalog::Modality::Audio => "audio",
         catalog::Modality::Video => "video",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeMap;
+
+    use crate::catalog;
+    use crate::config::Config;
+
+    use super::document;
+
+    const DIALECTS: [catalog::Dialect; 11] = [
+        catalog::Dialect::Chat,
+        catalog::Dialect::Responses,
+        catalog::Dialect::Messages,
+        catalog::Dialect::Decisions,
+        catalog::Dialect::SystemOne,
+        catalog::Dialect::Extraction,
+        catalog::Dialect::Embeddings,
+        catalog::Dialect::Transcription,
+        catalog::Dialect::Speech,
+        catalog::Dialect::Realtime,
+        catalog::Dialect::Diarization,
+    ];
+
+    fn example_without_chatgpt() -> Config {
+        let mut config: Config = toml::from_str(include_str!("../infer.example.toml")).unwrap();
+        config.providers.remove("chatgpt");
+        config
+    }
+
+    fn dialect_named(name: &str) -> catalog::Dialect {
+        DIALECTS
+            .into_iter()
+            .find(|dialect| dialect.as_str() == name)
+            .unwrap_or_else(|| panic!("unknown dialect {name}"))
+    }
+
+    fn listed_providers(document: &serde_json::Value, id: &str) -> BTreeMap<String, String> {
+        let mut listed = BTreeMap::new();
+        for model in document["models"].as_array().unwrap() {
+            if model["id"].as_str() != Some(id) {
+                continue;
+            }
+            let provider = model["provider"].as_str().unwrap().to_owned();
+            for dialect in model["dialects"].as_array().unwrap() {
+                let name = dialect.as_str().unwrap().to_owned();
+                let previous = listed.insert(name.clone(), provider.clone());
+                assert!(previous.is_none(), "{id} lists {name} under two providers");
+            }
+        }
+        listed
+    }
+
+    #[test]
+    fn listed_models_match_resolve_model() {
+        let config = example_without_chatgpt();
+        let document = document(&config);
+        for model in document["models"].as_array().unwrap() {
+            let id = model["id"].as_str().unwrap();
+            let provider = model["provider"].as_str().unwrap();
+            for dialect_name in model["dialects"].as_array().unwrap() {
+                let name = dialect_name.as_str().unwrap();
+                let dialect = dialect_named(name);
+                let resolved = config.resolve_model(id, dialect);
+                assert!(
+                    resolved
+                        .as_ref()
+                        .is_ok_and(|selection| selection.provider == provider),
+                    "{id} is listed for {name} under {provider}, resolve_model returned {resolved:?}"
+                );
+            }
+        }
+        let listed = listed_providers(&document, "gpt-6-luna");
+        for dialect in DIALECTS {
+            let name = dialect.as_str();
+            match config.resolve_model("gpt-6-luna", dialect) {
+                Ok(selection) => assert_eq!(
+                    listed.get(name).map(String::as_str),
+                    Some(selection.provider),
+                    "gpt-6-luna for {name}, listed {listed:?}"
+                ),
+                Err(error) => assert!(
+                    !listed.contains_key(name),
+                    "gpt-6-luna is listed for {name} but resolve_model returned no provider: {error}; listed {listed:?}"
+                ),
+            }
+        }
     }
 }
