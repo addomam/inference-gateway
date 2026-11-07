@@ -2913,3 +2913,77 @@ async fn v01_codex_nonstream_responses_never_leak_sse_as_successful_json() -> Re
     );
     Ok(())
 }
+
+#[tokio::test]
+async fn near_miss_paths_do_not_reach_the_provider() -> Result<()> {
+    let mut fixture = Fixture::start(vec![json_reply(json!({"ok": true}))]).await?;
+    let gateway = Gateway::start("openai", &fixture.base, "upstream", None).await?;
+    let body = chat_request(false);
+    for path in ["/v1/chat/completions/", "/v1/messages/extra"] {
+        let response = gateway.post(path, &body).await?;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND, "{path}");
+    }
+    let response = gateway
+        .client
+        .get(format!("{}/v1/responses", gateway.base))
+        .header("x-infer-key", &gateway.proxy_token)
+        .send()
+        .await?;
+    assert_eq!(
+        response.status(),
+        StatusCode::NOT_FOUND,
+        "GET /v1/responses"
+    );
+    let session_events = gateway.post("/session-events/", &body).await?;
+    assert_eq!(
+        session_events.status(),
+        StatusCode::NOT_FOUND,
+        "POST /session-events/"
+    );
+    let session_extra = gateway.post("/session-events/extra", &body).await?;
+    assert_eq!(
+        session_extra.status(),
+        StatusCode::NOT_FOUND,
+        "POST /session-events/extra"
+    );
+    let capabilities = gateway
+        .client
+        .get(format!("{}/v1/capabilities/", gateway.base))
+        .header("x-infer-key", &gateway.proxy_token)
+        .send()
+        .await?;
+    assert_eq!(
+        capabilities.status(),
+        StatusCode::NOT_FOUND,
+        "GET /v1/capabilities/"
+    );
+    let capabilities_extra = gateway
+        .client
+        .get(format!("{}/v1/capabilities/extra", gateway.base))
+        .header("x-infer-key", &gateway.proxy_token)
+        .send()
+        .await?;
+    assert_eq!(
+        capabilities_extra.status(),
+        StatusCode::NOT_FOUND,
+        "GET /v1/capabilities/extra"
+    );
+    let realtime = gateway
+        .client
+        .get(format!("{}/v1/realtime/", gateway.base))
+        .header("x-infer-key", &gateway.proxy_token)
+        .send()
+        .await?;
+    assert_eq!(
+        realtime.status(),
+        StatusCode::NOT_FOUND,
+        "GET /v1/realtime/"
+    );
+    assert!(fixture.captured.try_recv().is_err());
+
+    let served = gateway.post("/v1/chat/completions", &body).await?;
+    assert_eq!(served.status(), StatusCode::OK);
+    let captured = fixture.received().await?;
+    assert_eq!(captured.path, "/v1/chat/completions");
+    Ok(())
+}

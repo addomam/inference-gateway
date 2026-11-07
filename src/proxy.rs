@@ -282,20 +282,6 @@ async fn control_no_cache(request: Request, next: Next) -> Response {
     response
 }
 
-fn account_product(path: &str) -> bool {
-    const FAMILIES: &[&str] = &[
-        "/v1/assistants",
-        "/v1/threads",
-        "/v1/batches",
-        "/v1/fine_tuning",
-        "/v1/fine-tunes",
-        "/v1/vector_stores",
-        "/v1/evals",
-    ];
-    FAMILIES
-        .iter()
-        .any(|family| path == *family || path.starts_with(&format!("{family}/")))
-}
 fn error_response(status: StatusCode, message: &str, id: Option<&str>) -> Response {
     let mut response = (
         status,
@@ -403,29 +389,41 @@ async fn reject(writer: &Writer, id: &str, status: StatusCode, message: &str) ->
     error_response(status, message, Some(id))
 }
 
-async fn inference(State(app): State<App>, request: Request) -> Response {
-    let (parts, body) = request.into_parts();
-    let path = parts.uri.path();
-    let raw = path
-        .strip_prefix("/providers/")
-        .and_then(|s| s.split_once('/'));
-    if raw.is_none() && (path == "/v1/uploads" || path.starts_with("/v1/uploads/")) {
-        return error_response(
+fn local_response(local: crate::route::LocalRoute) -> Response {
+    match local {
+        crate::route::LocalRoute::Uploads => error_response(
             StatusCode::NOT_IMPLEMENTED,
             "segmented uploads are not routed; use POST /v1/files",
             None,
-        );
-    }
-    if raw.is_none() && (path == "/v1/files" || path.starts_with("/v1/files/")) {
-        return error_response(StatusCode::NOT_FOUND, "unknown files route", None);
-    }
-    if raw.is_none() && account_product(path) {
-        return error_response(
+        ),
+        crate::route::LocalRoute::Files => {
+            error_response(StatusCode::NOT_FOUND, "unknown files route", None)
+        }
+        crate::route::LocalRoute::AccountProduct => error_response(
             StatusCode::NOT_IMPLEMENTED,
             "infer does not route OpenAI account products (assistants, threads, batches, fine-tunes, vector stores, evals); they have no migration path",
             None,
-        );
+        ),
+        crate::route::LocalRoute::Dedicated => {
+            error_response(StatusCode::NOT_FOUND, "unknown route", None)
+        }
     }
+}
+
+async fn inference(State(app): State<App>, request: Request) -> Response {
+    let (parts, body) = request.into_parts();
+    let path = parts.uri.path();
+    let recognized = match crate::route::admit(&parts.method, path) {
+        crate::route::Admission::Reject => {
+            return error_response(StatusCode::NOT_FOUND, "unknown route", None);
+        }
+        crate::route::Admission::Local(local) => return local_response(local),
+        crate::route::Admission::Prepared(route) => Some(route),
+        crate::route::Admission::Native => None,
+    };
+    let raw = path
+        .strip_prefix("/providers/")
+        .and_then(|s| s.split_once('/'));
     let (provider_name, suffix, auto) = match raw {
         Some((name, suffix)) => (name.to_owned(), format!("/{suffix}"), false),
         None => (app.config.default_provider.clone(), path.to_owned(), true),
@@ -466,11 +464,7 @@ async fn inference(State(app): State<App>, request: Request) -> Response {
         };
         return reject(&writer, &id, StatusCode::NOT_IMPLEMENTED, message).await;
     }
-    let route = if auto {
-        crate::route::Route::recognize(&parts.method, path)
-    } else {
-        None
-    };
+    let route = if auto { recognized } else { None };
     if let Some(route) = route {
         let mut stream = body.into_data_stream();
         let mut data = Vec::new();
