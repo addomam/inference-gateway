@@ -1,0 +1,75 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: cargo test --locked -- --test-threads=1
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo test --locked -- --test-threads=1
+
+  clippy:
+    name: cargo clippy --locked --all-targets -- -D warnings
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - run: cargo clippy --locked --all-targets -- -D warnings
+
+  fmt:
+    name: cargo fmt --check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - run: cargo fmt --check
+
+  release:
+    name: cargo build --release --locked
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo build --release --locked
+
+  trace-completion:
+    name: trace completion order
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: faithful model
+        run: python3 .cursor/skills/verify-trace-completion/check.py
+      - name: checker still rejects broken orders
+        run: |
+          expect_exit_2() {
+            set +e
+            "$@"
+            status=$?
+            set -e
+            if [ "$status" -ne 2 ]; then
+              echo "expected exit 2, got ${status}: $*"
+              exit 1
+            fi
+          }
+          expect_exit_2 python3 .cursor/skills/verify-trace-completion/check.py --broken commit-before-sync
+          expect_exit_2 python3 .cursor/skills/verify-trace-completion/check.py --broken finish-after-failed
+          expect_exit_2 python3 .cursor/skills/verify-trace-completion/check.py .cursor/skills/verify-trace-completion/fixtures/early-complete.rs
+          expect_exit_2 python3 .cursor/skills/verify-trace-completion/check.py .cursor/skills/verify-trace-completion/fixtures/discard-sync.rs
+          expect_exit_2 python3 .cursor/skills/verify-trace-completion/check.py .cursor/skills/verify-trace-completion/fixtures/failed-after-write.rs

@@ -14,6 +14,7 @@ All original material in this repository is dedicated to the public domain under
 - [Inspect and export](#inspect-and-export), including [OMP traces](#omp-execution-traces)
 - [Local-history imports](#native-local-history-imports) and [provider account exports](#provider-account-export-imports)
 - [Reverse proxy and operations](#reverse-proxy-and-operations)
+- [Kubernetes](#kubernetes)
 - [Integration validation](#integration-validation)
 - [Architecture](docs/architecture.md), [data flow](docs/data-flow.md), and [database schema](docs/database-schema.md)
 - [Development conventions](CONVENTIONS.md)
@@ -46,20 +47,20 @@ base_url = "http://127.0.0.1:8082"
 ### Routing
 
 * `/providers/NAME/PATH`: native passthrough. For example `/providers/anthropic/v1/messages`, `/providers/openai/v1/responses`, `/providers/openai_decisions/v1/decisions`, `/providers/typesafe/v1/systemone`, `/providers/cloudflare/client/v4/accounts/ACCOUNT/ai/run/@cf/cloudflare/clairic`, `/providers/grok/v1/chat/completions`, `/providers/llama/v1/chat/completions`. Arbitrary HTTP methods, paths, query strings, binary bodies, provider errors, and SSE are forwarded. No schema translation or model aliasing. A Codex provider uses `/providers/chatgpt/responses` because its configured base includes `/backend-api/codex`.
-* `POST /v1/messages`, `/v1/chat/completions`, `/v1/responses`: resolve `model` by an exact `[models]` alias, then by a configured provider `namespace` (`xai/grok-4.7` selects namespace `xai` and sends upstream model `grok-4.7`), then by the compiled model catalog, otherwise use `default_provider` and the original model. A catalog hit selects a configured provider of that model's family that speaks a reachable dialect. A known model on an unsupported route is rejected. An unknown id falls through and logs a warning so the catalog can be updated. A slash whose prefix is not a configured namespace stays part of the model id. Translate to the destination dialect when necessary. No automatic fallback, hidden model substitution, or inference retries.
+* `POST /v1/messages`, `/v1/chat/completions`, `/v1/responses`: resolve `model` by an exact `[models]` alias, then by a configured provider `namespace` (`xai/grok-4.7` selects namespace `xai` and sends upstream model `grok-4.7`), then by the compiled model catalog, otherwise use `default_provider` and the original model. A catalog hit selects a configured provider of that model's family that speaks a reachable dialect. A known model on an unsupported route is rejected. An alias is rejected when its provider cannot speak the client dialect, including the supported generation and Decisions/System One translations. An unknown id falls through to `default_provider` and logs a warning so the catalog can be updated, and is rejected the same way when that provider cannot speak the dialect. A slash whose prefix is not a configured namespace stays part of the model id. Translate to the destination dialect when necessary. No automatic fallback, hidden model substitution, or inference retries.
 * `POST /v1/decisions`: the same model resolution for OpenAI Decisions requests. A provider that speaks Decisions forwards the body. A provider that speaks System One, including local Jev on llama.cpp, translates predicate/choice/score questions and text input, then maps named answers back. A System One client can target a Decisions provider the same way for string state and those three question types. Images, files, Box questions, object state, and unknown question types are rejected. Only a changed `model` is rewritten on a native Decisions provider.
 * `POST /v1/systemone`: the same model resolution for JSON System One requests (`model`, `state`, `questions`). The selected provider must speak System One (`system_one` or `llama`), or speak Decisions, in which case string state and noul/choice/score questions are translated. Only a changed model is rewritten on a native System One provider; typed answers, probabilities, confidence, usage, and the upstream's resolved model name pass through unchanged. Cataloged Jev ids `jev-latest`, `jev-preview`, and `jev-1.14` accept images and Box questions; `jev-1.13` accepts images but not Box. Those requests must send `TypeSafe-Danger-Zone-Images: true`, unless the provider sets `danger_zone_images = true`, in which case infer adds the header. Other cataloged models reject both. Uncataloged models are not schema-filtered.
 * `POST /v1/embeddings`: the same model resolution for OpenAI Embeddings requests. `openai` and `llama` forward the body to `/v1/embeddings`; an alias changes only `model`. String, string-array, and token-array `input`, `encoding_format`, and `user` pass through. llama.cpp ignores `dimensions` and would return the model width, so that field is rejected before dispatch. `text-embedding-ada-002` is rejected the same way. OpenAI embedding models accept text and token arrays only. `ggml-org/embeddinggemma-2-GGUF:Q8_0` also accepts llama.cpp `image_url`, `input_audio`, and `input_video` content parts. Remove `dimensions` or use a model that applies it.
 * Daybreak is not a separate upstream model. `gpt-6-sol#daybreak-blue`, `gpt-6.1-sol#daybreak-blue`, `gpt-6-astra#daybreak-blue`, and `gpt-5.6-cyber#daybreak-red` resolve to the base model and set Responses `access_programs.cyber`. An OpenAI provider `daybreak` ceiling defaults to `standard`, which rejects those programs and omits the matching models from `GET /v1/capabilities`. Set `daybreak = "blue"` or `"red"` to allow them. infer does not query upstream entitlement for this flag; the ceiling is local configuration.
 * `POST /client/v4/accounts/ACCOUNT/ai/run/@cf/cloudflare/clairic`: the canonical Cloudflare Workers AI route. The body `model` uses the same resolution, and the selected provider must have `kind = "clairic"`. Current SDK percent-encoding of the model path is accepted and normalized to Cloudflare's slash-separated upstream route. The account remains the caller-supplied path component.
-* `GET /v1/capabilities`: the machine-readable route, provider, and model document for this process. It lists catalog models a configured provider can serve, including Daybreak ids only when that provider's ceiling allows them. `/v1/models` remains the selected backend's own list, not this document.
+* `GET /v1/capabilities`: the machine-readable route, provider, and model document for this process. It lists catalog models a configured provider can serve, including Daybreak ids only when that provider's ceiling allows them. Each model's `dialects` are the client dialects `resolve_model` accepts for that provider. One id is repeated when different dialects resolve to different providers. `/v1/models` remains the selected backend's own list, not this document.
 * `POST /v1/audio/transcriptions` and `POST /v1/audio/speech`: OpenAI audio routes. The selected model must declare `transcribe`, `diarize`, or `speak`, and the provider must already speak that OpenAI path. `response_format=diarized_json` requires `diarize`. A transcriber does not call a second diarization model. A local model not in the catalog can declare operations on its `[models]` alias. Unknown models may transcribe or speak only when the provider speaks the route; they cannot diarize. Routed audio is buffered to `max_request_bytes`.
 * `POST /v1/audio/diarization`: speaker turns only (`file`, `model`, optional `response_format` of `json` or `rttm`). A model must declare `diarize` and not `transcribe`. `include_text` is rejected. No configured provider speaks this route, so a valid request fails closed instead of falling through. A transcription model that also declares `diarize` stays on `/v1/audio/transcriptions`.
 * Audio and video generation input require a provider that already speaks the client protocol. Catalog records and explicit `[models]` alias `modalities` declarations constrain accepted input. Unknown models without declarations defer media support to the provider. infer does not transcribe, sample, or translate audio/video input. Image URL and data-URL translation is unchanged.
 * `GET /v1/realtime`: WebSocket proxy. The `model` query must resolve to a model that declares `realtime` and a provider that speaks that websocket. infer rewrites the provider credential and copies frames. It does not run a voice pipeline. Any other upgrade remains HTTP 501.
 * `POST /v1/files`: stores the bytes in the same content-addressed blob tree as trace artifacts and returns an infer id (`file-` plus 32 hex digits). `purpose` must be `user_data` or `vision`. A later routed JSON request that contains that id uses a cached file id for the selected provider, if available. Otherwise infer uploads the bytes, remembers the provider's file id, and sends that id instead. Concurrent first uses can upload the same bytes more than once. `openai`, `grok`, and `anthropic` accept the upload. Other providers reject the request. `GET /v1/files/{id}` and `GET /v1/files/{id}/content` read the stored bytes. `DELETE` removes the index row and leaves the blob. `/v1/uploads` is refused. `/providers/NAME/v1/files` remains the raw provider pipe and does not create an infer id.
 * Root account-product paths return HTTP 501: `/v1/assistants`, `/v1/threads`, `/v1/batches`, `/v1/fine_tuning`, `/v1/fine-tunes`, `/v1/vector_stores`, `/v1/evals`, and their child paths. Explicit provider paths retain native passthrough for these APIs.
-* Other paths use native passthrough to `default_provider`. `/v1/models` queries that backend rather than a synthesized union. `/v1/messages/count_tokens` is native-only, not an approximate tokenizer for translated models.
+* Other paths use native passthrough to `default_provider`. A non-POST on a prepared route, and any path under a prepared route or under `/v1/capabilities`, `/v1/realtime`, or `/session-events`, is rejected before that provider is contacted. `/v1/messages/count_tokens` stays native passthrough and is not an approximate tokenizer for translated models. `/v1/models` queries the default backend rather than a synthesized union. Explicit `/providers/NAME/...` paths are unchanged.
 
 Provider kinds: `anthropic`, `openai`, `openai_decisions`, `grok`, `llama`, `codex`, `system_one`, `clairic`. `openai` and `llama` also speak OpenAI embeddings. `openai_decisions`, `system_one`, and `clairic` are native typed APIs rather than generation dialects; `openai` remains a generation provider. Optional `namespace` is the client model prefix for that provider. Two providers may share a namespace only when they implement different APIs; the same namespace and API is a configuration error. A configured namespace sent to an API that provider does not implement returns HTTP 400. `base_url` normally contains the origin **without `/v1` or `/client/v4`**. A deployment path prefix is allowed. Redirects are returned, never followed with provider credentials. Outbound connections intentionally ignore `HTTP_PROXY`/`HTTPS_PROXY` environment settings.
 
@@ -298,7 +299,7 @@ infer does not fetch image URLs, resize assets, validate Cloudflare's field sche
 
 ### Authentication and subscriptions
 
-Gateway authentication accepts `x-infer-key`, `Authorization: Bearer`, or `x-api-key`, in that precedence. Inference and control tokens must differ. These credentials are never forwarded as upstream credentials.
+Gateway authentication accepts `x-infer-key`, `Authorization: Bearer`, or `x-api-key`, in that precedence. Inference and control tokens must differ. These credentials are never forwarded as upstream credentials. The client header `api-key` is removed from every upstream request, including passthrough. Passthrough forwards only `Authorization` and `x-api-key`.
 
 Provider `auth.mode`:
 
@@ -412,6 +413,8 @@ The control API requires **`INFER_CONTROL_TOKEN`**, not the inference token:
 
 ```sh
 curl -H "Authorization: Bearer $INFER_CONTROL_TOKEN" http://127.0.0.1:8081/health
+# Same check, for a shell-less container. It does not follow redirects or use HTTP_PROXY.
+infer --config infer.toml probe
 curl -H "Authorization: Bearer $INFER_CONTROL_TOKEN" http://127.0.0.1:8081/providers
 curl -H "Authorization: Bearer $INFER_CONTROL_TOKEN" 'http://127.0.0.1:8081/traces?limit=50'
 curl -H "Authorization: Bearer $INFER_CONTROL_TOKEN" http://127.0.0.1:8081/traces/TRACE_ID
@@ -801,6 +804,46 @@ cargo clippy --locked --all-targets -- -D warnings
 cargo fmt --check
 cargo build --release --locked
 ```
+
+## Kubernetes
+
+CI builds a distroless image and does not push it. Build the same image locally, then load it into your cluster or push it to a registry you choose:
+
+```sh
+docker build -t infer:local .
+```
+
+The image runs as uid 65532, with a read-only root filesystem. It listens only where `infer.toml` says. The container entrypoint is `/infer`.
+
+`deploy/base` is a Kustomize base for one replica:
+
+* a Deployment that runs `/infer --config /etc/infer/infer.toml serve`
+* a Service `infer` for the inference listener and a Service `infer-control` for the control listener
+* a ConfigMap generated from `deploy/base/infer.toml`
+* a PersistentVolumeClaim mounted at `/var/lib/infer`
+* environment references to a Secret named `infer-credentials` (`proxy-token`, `control-token`, `upstream-token`)
+
+The Secret is not created by the base. `deploy/base/secret.example.yaml` shows the key names with placeholder values. Generate the two gateway tokens yourself; they must differ, and each must be at least 16 visible ASCII characters with no whitespace. Do not commit the real Secret.
+
+```sh
+kubectl -n infer create secret generic infer-credentials \
+  --from-literal=proxy-token="$(openssl rand -hex 32)" \
+  --from-literal=control-token="$(openssl rand -hex 32)" \
+  --from-literal=upstream-token="$UPSTREAM_API_KEY"
+kubectl apply -k deploy/base
+```
+
+Edit `deploy/base/infer.toml` before applying it. The sample provider is one OpenAI-compatible upstream at `http://upstream:8080` with bearer auth. Remove that shape if you use a different kind, and set `base_url` to your upstream. Listeners are `0.0.0.0` so the pod network can reach them. Terminate TLS at your ingress or reverse proxy; do not publish the control Service except on an administrative route.
+
+The trace index is SQLite (WAL, `synchronous=FULL`) plus body and artifact files under `trace_dir`. One process is safe on a ReadWriteOnce volume that provides POSIX file locks, such as a block volume. Two processes are not: the store is one connection per process, and a second writer can corrupt the index. Codex refresh is also process-local. The Deployment is `replicas: 1` with `strategy: Recreate`, so a rollout does not run two pods against the volume. Do not scale it and do not switch the claim to ReadWriteMany. The claim requests 10Gi and leaves the StorageClass unset so the cluster default is used. The gateway does not delete traces or enforce a disk quota.
+
+The process reads configuration and credentials at startup. Changing either requires a new process. Kustomize appends a content hash to the ConfigMap name and rewrites the pod template, so `kubectl apply -k deploy/base` after an `infer.toml` edit rolls the Deployment. A Secret change does not, because the Secret is not generated by Kustomize; run `kubectl -n infer rollout restart deploy/infer` after rotating a token. Old hashed ConfigMaps are left in the namespace.
+
+An init container, running as root with only `CHOWN`, changes `/var/lib/infer` to uid 65532 so the non-root process can apply its directory mode. The infer container itself sets `runAsNonRoot`. A namespace that enforces the restricted Pod Security profile will reject the root init container; use baseline, or exempt this pod. Probes exec `/infer --config /etc/infer/infer.toml probe`. That calls the existing authenticated `GET /health` on the control listener, which checks that the trace index can be read. There is no shell in the image, and the control token is not written into the probe manifest.
+
+Requests and limits in the Deployment are a starting point (100m/256Mi requested, 1 CPU/1Gi limited), not a measured production profile. Routed bodies are buffered up to `max_request_bytes` (32 MiB by default).
+
+`deploy/e2e/smoke.sh` builds `infer:local`, starts a kind cluster, applies `deploy/overlays/e2e` with a Python chat stub, and checks one completion plus its trace. GitHub Actions runs that script and does not push the image. The script deletes a cluster it created unless `KEEP_CLUSTER=1`.
 
 ## Integration validation
 

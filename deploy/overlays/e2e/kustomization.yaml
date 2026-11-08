@@ -1,0 +1,18 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: infer
+resources:
+  - ../../base
+  - stub.yaml
+images:
+  - name: infer
+    newName: infer
+    newTag: local
+configMapGenerator:
+  - name: infer-config
+    behavior: replace
+    files:
+      - infer.toml
+  - name: stub-script
+    files:
+      - stub.py

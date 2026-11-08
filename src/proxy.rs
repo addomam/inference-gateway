@@ -102,6 +102,34 @@ pub fn validate_runtime(config: &Config) -> Result<()> {
     Ok(())
 }
 
+/// GET `{control_listen}/health` with the control token. The image has no shell,
+/// so a container probe runs this command in the same network namespace.
+pub async fn probe(config: &Config) -> Result<()> {
+    let token = secret(&config.control_token_env)?;
+    probe_address(config.control_listen, &token).await
+}
+
+async fn probe_address(address: std::net::SocketAddr, token: &str) -> Result<()> {
+    let client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(Duration::from_secs(5))
+        .no_proxy()
+        .build()
+        .context("building control health client")?;
+    let response = client
+        .get(format!("http://{address}/health"))
+        .bearer_auth(token)
+        .send()
+        .await
+        .context("control health request failed")?;
+    let status = response.status();
+    if status.is_success() {
+        Ok(())
+    } else {
+        bail!("control health returned HTTP {}", status.as_u16());
+    }
+}
+
 pub async fn serve(config: Config) -> Result<()> {
     validate_runtime(&config)?;
     let proxy_token = Arc::new(secret(&config.proxy_token_env)?);
@@ -282,20 +310,6 @@ async fn control_no_cache(request: Request, next: Next) -> Response {
     response
 }
 
-fn account_product(path: &str) -> bool {
-    const FAMILIES: &[&str] = &[
-        "/v1/assistants",
-        "/v1/threads",
-        "/v1/batches",
-        "/v1/fine_tuning",
-        "/v1/fine-tunes",
-        "/v1/vector_stores",
-        "/v1/evals",
-    ];
-    FAMILIES
-        .iter()
-        .any(|family| path == *family || path.starts_with(&format!("{family}/")))
-}
 fn error_response(status: StatusCode, message: &str, id: Option<&str>) -> Response {
     let mut response = (
         status,
@@ -354,6 +368,7 @@ fn filtered_headers(headers: &HeaderMap, request: bool) -> HeaderMap {
                     "host"
                         | "authorization"
                         | "x-api-key"
+                        | "api-key"
                         | "x-infer-key"
                         | "cookie"
                         | "forwarded"
@@ -402,29 +417,41 @@ async fn reject(writer: &Writer, id: &str, status: StatusCode, message: &str) ->
     error_response(status, message, Some(id))
 }
 
-async fn inference(State(app): State<App>, request: Request) -> Response {
-    let (parts, body) = request.into_parts();
-    let path = parts.uri.path();
-    let raw = path
-        .strip_prefix("/providers/")
-        .and_then(|s| s.split_once('/'));
-    if raw.is_none() && (path == "/v1/uploads" || path.starts_with("/v1/uploads/")) {
-        return error_response(
+fn local_response(local: crate::route::LocalRoute) -> Response {
+    match local {
+        crate::route::LocalRoute::Uploads => error_response(
             StatusCode::NOT_IMPLEMENTED,
             "segmented uploads are not routed; use POST /v1/files",
             None,
-        );
-    }
-    if raw.is_none() && (path == "/v1/files" || path.starts_with("/v1/files/")) {
-        return error_response(StatusCode::NOT_FOUND, "unknown files route", None);
-    }
-    if raw.is_none() && account_product(path) {
-        return error_response(
+        ),
+        crate::route::LocalRoute::Files => {
+            error_response(StatusCode::NOT_FOUND, "unknown files route", None)
+        }
+        crate::route::LocalRoute::AccountProduct => error_response(
             StatusCode::NOT_IMPLEMENTED,
             "infer does not route OpenAI account products (assistants, threads, batches, fine-tunes, vector stores, evals); they have no migration path",
             None,
-        );
+        ),
+        crate::route::LocalRoute::Dedicated => {
+            error_response(StatusCode::NOT_FOUND, "unknown route", None)
+        }
     }
+}
+
+async fn inference(State(app): State<App>, request: Request) -> Response {
+    let (parts, body) = request.into_parts();
+    let path = parts.uri.path();
+    let recognized = match crate::route::admit(&parts.method, path) {
+        crate::route::Admission::Reject => {
+            return error_response(StatusCode::NOT_FOUND, "unknown route", None);
+        }
+        crate::route::Admission::Local(local) => return local_response(local),
+        crate::route::Admission::Prepared(route) => Some(route),
+        crate::route::Admission::Native => None,
+    };
+    let raw = path
+        .strip_prefix("/providers/")
+        .and_then(|s| s.split_once('/'));
     let (provider_name, suffix, auto) = match raw {
         Some((name, suffix)) => (name.to_owned(), format!("/{suffix}"), false),
         None => (app.config.default_provider.clone(), path.to_owned(), true),
@@ -465,11 +492,7 @@ async fn inference(State(app): State<App>, request: Request) -> Response {
         };
         return reject(&writer, &id, StatusCode::NOT_IMPLEMENTED, message).await;
     }
-    let route = if auto {
-        crate::route::Route::recognize(&parts.method, path)
-    } else {
-        None
-    };
+    let route = if auto { recognized } else { None };
     if let Some(route) = route {
         let mut stream = body.into_data_stream();
         let mut data = Vec::new();
@@ -3114,6 +3137,45 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn routed_requests_drop_api_key_and_passthrough_keeps_x_api_key() {
+        let mut incoming = HeaderMap::new();
+        incoming.insert("api-key", HeaderValue::from_static("client-secret"));
+        incoming.insert("x-api-key", HeaderValue::from_static("client-x-key"));
+        incoming.insert(
+            "authorization",
+            HeaderValue::from_static("Bearer client-token"),
+        );
+        incoming.insert("accept", HeaderValue::from_static("application/json"));
+
+        let routed = filtered_headers(&incoming, true);
+        assert!(
+            routed.get("api-key").is_none(),
+            "routed request still contains api-key: {:?}",
+            routed.get("api-key").and_then(|value| value.to_str().ok())
+        );
+        assert_eq!(routed["accept"], "application/json");
+        assert_eq!(
+            filtered_headers(&incoming, false)["api-key"],
+            "client-secret",
+            "response filtering must keep api-key"
+        );
+
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let passthrough = ProviderAuth::new(crate::auth::AuthConfig {
+            mode: "passthrough".into(),
+            ..crate::auth::AuthConfig::default()
+        })
+        .unwrap();
+        let forwarded = passthrough
+            .headers(&client, false, &incoming)
+            .await
+            .unwrap();
+        assert_eq!(forwarded["x-api-key"], "client-x-key");
+        assert_eq!(forwarded["authorization"], "Bearer client-token");
+        assert!(forwarded.get("api-key").is_none());
+    }
+
     #[test]
     fn gateway_tokens_cannot_bypass_bearer_sanitization_with_whitespace() {
         for invalid in [
@@ -3131,5 +3193,44 @@ mod tests {
         let mut headers = HeaderMap::new();
         headers.insert("authorization", value);
         assert!(provider_credentials(&headers, key).is_empty());
+    }
+
+    #[tokio::test]
+    async fn control_probe_sends_the_token_and_rejects_other_statuses() {
+        let ok = tokio::net::TcpListener::bind("0.0.0.0:0").await.unwrap();
+        let ok_address = ok.local_addr().unwrap();
+        let ok_app = Router::new().route(
+            "/health",
+            get(|headers: HeaderMap| async move {
+                if headers
+                    .get("authorization")
+                    .and_then(|value| value.to_str().ok())
+                    == Some("Bearer control-token-value")
+                {
+                    axum::Json(json!({"status":"ok"})).into_response()
+                } else {
+                    StatusCode::UNAUTHORIZED.into_response()
+                }
+            }),
+        );
+        tokio::spawn(async move {
+            axum::serve(ok, ok_app).await.unwrap();
+        });
+        probe_address(ok_address, "control-token-value")
+            .await
+            .unwrap();
+
+        let denied = tokio::net::TcpListener::bind("0.0.0.0:0").await.unwrap();
+        let denied_address = denied.local_addr().unwrap();
+        let denied_app =
+            Router::new().route("/health", get(|| async { StatusCode::SERVICE_UNAVAILABLE }));
+        tokio::spawn(async move {
+            axum::serve(denied, denied_app).await.unwrap();
+        });
+        let error = probe_address(denied_address, "control-token-value")
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("503"), "{error}");
     }
 }
