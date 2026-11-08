@@ -102,6 +102,34 @@ pub fn validate_runtime(config: &Config) -> Result<()> {
     Ok(())
 }
 
+/// GET `{control_listen}/health` with the control token. The image has no shell,
+/// so a container probe runs this command in the same network namespace.
+pub async fn probe(config: &Config) -> Result<()> {
+    let token = secret(&config.control_token_env)?;
+    probe_address(config.control_listen, &token).await
+}
+
+async fn probe_address(address: std::net::SocketAddr, token: &str) -> Result<()> {
+    let client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(Duration::from_secs(5))
+        .no_proxy()
+        .build()
+        .context("building control health client")?;
+    let response = client
+        .get(format!("http://{address}/health"))
+        .bearer_auth(token)
+        .send()
+        .await
+        .context("control health request failed")?;
+    let status = response.status();
+    if status.is_success() {
+        Ok(())
+    } else {
+        bail!("control health returned HTTP {}", status.as_u16());
+    }
+}
+
 pub async fn serve(config: Config) -> Result<()> {
     validate_runtime(&config)?;
     let proxy_token = Arc::new(secret(&config.proxy_token_env)?);
@@ -3165,5 +3193,44 @@ mod tests {
         let mut headers = HeaderMap::new();
         headers.insert("authorization", value);
         assert!(provider_credentials(&headers, key).is_empty());
+    }
+
+    #[tokio::test]
+    async fn control_probe_sends_the_token_and_rejects_other_statuses() {
+        let ok = tokio::net::TcpListener::bind("0.0.0.0:0").await.unwrap();
+        let ok_address = ok.local_addr().unwrap();
+        let ok_app = Router::new().route(
+            "/health",
+            get(|headers: HeaderMap| async move {
+                if headers
+                    .get("authorization")
+                    .and_then(|value| value.to_str().ok())
+                    == Some("Bearer control-token-value")
+                {
+                    axum::Json(json!({"status":"ok"})).into_response()
+                } else {
+                    StatusCode::UNAUTHORIZED.into_response()
+                }
+            }),
+        );
+        tokio::spawn(async move {
+            axum::serve(ok, ok_app).await.unwrap();
+        });
+        probe_address(ok_address, "control-token-value")
+            .await
+            .unwrap();
+
+        let denied = tokio::net::TcpListener::bind("0.0.0.0:0").await.unwrap();
+        let denied_address = denied.local_addr().unwrap();
+        let denied_app =
+            Router::new().route("/health", get(|| async { StatusCode::SERVICE_UNAVAILABLE }));
+        tokio::spawn(async move {
+            axum::serve(denied, denied_app).await.unwrap();
+        });
+        let error = probe_address(denied_address, "control-token-value")
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("503"), "{error}");
     }
 }

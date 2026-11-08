@@ -1,0 +1,21 @@
+# Generic single-replica configuration. Edit base_url and kind for the
+# upstream you actually use, then restart. The process reads this file only
+# at startup. Listeners must be reachable inside the pod network; TLS stays
+# at the ingress or reverse proxy.
+listen = "0.0.0.0:8080"
+control_listen = "0.0.0.0:8081"
+proxy_token_env = "INFER_PROXY_TOKEN"
+control_token_env = "INFER_CONTROL_TOKEN"
+trace_dir = "/var/lib/infer"
+default_provider = "upstream"
+max_request_bytes = 33554432
+max_buffered_response_bytes = 33554432
+connect_timeout_seconds = 10
+read_timeout_seconds = 300
+
+[providers.upstream]
+kind = "openai"
+base_url = "http://upstream:8080"
+[providers.upstream.auth]
+mode = "bearer"
+token_env = "UPSTREAM_API_KEY"

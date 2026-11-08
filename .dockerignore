@@ -1,0 +1,10 @@
+.git
+.github
+.cursor
+target
+deploy
+tests
+data
+docs
+integrations
+*.md
