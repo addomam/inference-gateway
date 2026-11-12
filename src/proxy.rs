@@ -24,9 +24,10 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use subtle::ConstantTimeEq;
 use tokio::{io::AsyncReadExt, sync::Mutex};
+use tracing::Instrument;
 
 use crate::{
-    auth::{ProviderAuth, validate_runtime_credentials},
+    auth::{ProviderAuth, ensure_auth_directory_writable, validate_runtime_credentials},
     config::{Config, Provider},
     sensitive_headers::is_sensitive_header,
     trace::{
@@ -97,6 +98,13 @@ pub fn validate_runtime(config: &Config) -> Result<()> {
         if provider.auth.mode == "codex" {
             validate_runtime_credentials(&provider.auth)
                 .context("invalid Codex auth_file; run codex login with file credential storage")?;
+            ensure_auth_directory_writable(
+                provider
+                    .auth
+                    .auth_file
+                    .as_deref()
+                    .context("missing auth_file")?,
+            )?;
         }
     }
     Ok(())
@@ -295,7 +303,14 @@ async fn authenticate(State(key): State<Arc<String>>, request: Request, next: Ne
     if !credential.is_some_and(|value| matches_secret(value, &key)) {
         return error_response(StatusCode::UNAUTHORIZED, "invalid gateway credential", None);
     }
-    next.run(request).await
+    let method = request.method().to_string();
+    let path = request.uri().path().to_owned();
+    let span = tracing::info_span!(
+        "http.request",
+        http.request.method = %method,
+        url.path = %path,
+    );
+    next.run(request).instrument(span).await
 }
 
 async fn control_no_cache(request: Request, next: Next) -> Response {

@@ -529,6 +529,31 @@ fn resolve_auth_path(path: &Path) -> Result<PathBuf> {
     })
 }
 
+/// Refresh replaces `auth_file` in its directory. A read-only Secret mount
+/// would pass a token check and then fail the first refresh.
+pub(crate) fn ensure_auth_directory_writable(path: &Path) -> Result<()> {
+    let resolved = resolve_auth_path(path)?;
+    let parent = resolved.parent().ok_or_else(|| {
+        anyhow!("Codex auth_file has no parent directory. Mount a writable file, not a read-only secret.")
+    })?;
+    let probe = parent.join(format!(".infer-writable-{}.tmp", uuid::Uuid::new_v4()));
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let file = options.open(&probe).map_err(|error| {
+        anyhow!(
+            "Codex auth_file directory is not writable, so a refreshed token cannot be stored. Mount a writable file, not a read-only secret: {error}"
+        )
+    })?;
+    drop(file);
+    let _ = std::fs::remove_file(&probe);
+    Ok(())
+}
+
 pub(crate) fn validate_runtime_credentials(config: &AuthConfig) -> Result<()> {
     let path = config.auth_file.as_deref().context("missing auth_file")?;
     let snapshot = read_snapshot(path)?;
@@ -728,6 +753,34 @@ mod tests {
     use axum::{Json, Router, extract::State, http::StatusCode, routing::post};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tokio::{sync::Notify, task::JoinHandle};
+
+    #[test]
+    fn read_only_auth_directory_is_rejected() {
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("auth.json");
+        std::fs::write(&path, b"{}\n").unwrap();
+        let restore = directory.path().to_path_buf();
+        let mut permissions = std::fs::metadata(&restore).unwrap().permissions();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            permissions.set_mode(0o555);
+        }
+        std::fs::set_permissions(&restore, permissions).unwrap();
+        let error = ensure_auth_directory_writable(&path).unwrap_err();
+        let text = format!("{error:#}");
+        assert!(text.contains("not writable"), "{text}");
+        let mut permissions = std::fs::metadata(&restore).unwrap().permissions();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            permissions.set_mode(0o700);
+        }
+        std::fs::set_permissions(&restore, permissions).unwrap();
+    }
 
     fn jwt(exp: i64, account: Option<&str>) -> String {
         let mut claims = serde_json::json!({"exp": exp});
