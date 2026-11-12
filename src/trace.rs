@@ -16,7 +16,7 @@ use std::{
     time::Duration,
 };
 
-use anyhow::{Context, Result, ensure};
+use anyhow::{Context, Result, bail, ensure};
 use base64::{Engine, engine::general_purpose::STANDARD};
 use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
 use serde::{Deserialize, Deserializer, Serialize};
@@ -193,6 +193,9 @@ pub struct TraceStore {
 struct StoreInner {
     root: PathBuf,
     connection: Mutex<Option<Connection>>,
+    // Held for the life of the store. A second process fails instead of
+    // sharing this SQLite writer.
+    _writer_lock: StdFile,
 }
 
 impl Drop for StoreInner {
@@ -248,6 +251,7 @@ impl TraceStore {
         let inner = tokio::task::spawn_blocking(move || -> Result<StoreInner> {
             create_private_directory(&root, true)?;
             let root = root.canonicalize().context("resolve trace directory")?;
+            let writer_lock = lock_trace_directory(&root)?;
             create_private_directory(&root.join("artifacts"), true)?;
             create_private_directory(&root.join("artifacts").join("sha256"), true)?;
             let database = root.join("index.sqlite3");
@@ -426,6 +430,7 @@ impl TraceStore {
             Ok(StoreInner {
                 root,
                 connection: Mutex::new(Some(connection)),
+                _writer_lock: writer_lock,
             })
         })
         .await
@@ -1613,6 +1618,36 @@ fn describe_trace(root: &Path, row: IndexedTrace) -> Result<Value> {
     Ok(value)
 }
 
+fn lock_trace_directory(root: &Path) -> Result<StdFile> {
+    let path = root.join(".writer.lock");
+    let mut options = OpenOptions::new();
+    options.read(true).write(true).create(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+        options.custom_flags(libc::O_NOFOLLOW);
+    }
+    let file = options.open(&path).context("open the trace writer lock")?;
+    #[cfg(unix)]
+    {
+        use std::os::fd::AsRawFd;
+        let locked = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        if locked != 0 {
+            let error = std::io::Error::last_os_error();
+            if error.kind() == std::io::ErrorKind::WouldBlock
+                || error.raw_os_error() == Some(libc::EAGAIN)
+            {
+                bail!(
+                    "trace directory already has an infer writer; run one process against this volume"
+                );
+            }
+            return Err(error).context("lock the trace directory");
+        }
+    }
+    Ok(file)
+}
+
 fn create_private_directory(path: &Path, recursive: bool) -> Result<()> {
     let mut builder = fs::DirBuilder::new();
     builder.recursive(recursive);
@@ -1996,6 +2031,21 @@ mod tests {
             trace_id: None,
             payload: json!({"output": "complete tool output", "success": true}),
         }
+    }
+
+    #[tokio::test]
+    async fn a_second_open_fails_until_the_first_writer_is_dropped() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("traces");
+        let first = TraceStore::open(&root).await.unwrap();
+        let error = match TraceStore::open(&root).await {
+            Err(error) => error,
+            Ok(_) => panic!("second open succeeded"),
+        };
+        let text = format!("{error:#}");
+        assert!(text.contains("already has an infer writer"), "{text}");
+        drop(first);
+        TraceStore::open(&root).await.unwrap();
     }
 
     #[tokio::test]

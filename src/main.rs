@@ -141,14 +141,11 @@ struct ProviderExportImport {
     max_json_depth: usize,
 }
 
+mod telemetry;
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "infer=info".into()),
-        )
-        .init();
+    let _telemetry = telemetry::init()?;
     let cli = Cli::parse();
     let config = Config::load(&cli.config).await?;
     match cli.command.unwrap_or(Command::Serve) {
