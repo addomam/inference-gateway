@@ -6,7 +6,11 @@ FROM rust:1.99.1-bookworm AS build
 WORKDIR /src
 COPY Cargo.toml Cargo.lock ./
 COPY src ./src
-RUN cargo build --release --locked
+# opentelemetry-otlp's reqwest-rustls client builds aws-lc-sys, which needs CMake.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends cmake \
+    && rm -rf /var/lib/apt/lists/* \
+    && cargo build --release --locked
 
 FROM gcr.io/distroless/cc-debian13:nonroot
 COPY --from=build --chown=65532:65532 /src/target/release/infer /infer
