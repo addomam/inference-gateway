@@ -6,7 +6,9 @@
 //! `codex-rs/core/src/client.rs` (`build_responses_request`, session headers,
 //! `x-openai-internal-codex-responses-lite`), and
 //! `codex-rs/login/src/auth/default_client.rs` (`default_headers` sets `originator`
-//! and does not set a `version` header). Those request and models files match
+//! to `codex_cli_rs` and does not set `version`). `codex exec` overrides the
+//! originator to `codex_exec` and the provider map stamps `version` `0.169.0`.
+//! Those request and models files match
 //! release `rust-v0.169.0` (`d32063f96c2dff1dc96af839b3952abb6acfeda4`).
 //! `client_version_to_whole()` is the Cargo package version. That release stamps
 //! `0.169.0`. The main workspace version at the pinned commit is `0.0.0`, which

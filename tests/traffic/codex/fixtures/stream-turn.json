@@ -7,7 +7,7 @@
     "commit": "69231e119bfca0b14453515e97d99688ce1c47c9",
     "release": "rust-v0.169.0",
     "release_commit": "d32063f96c2dff1dc96af839b3952abb6acfeda4",
-    "note": "Source-derived, not a packet capture. Fields follow ResponsesApiRequest and build_responses_request at the pinned commit: stream true, store false, tool_choice auto, include reasoning.encrypted_content, input items typed as messages, and the bundled models.json reasoning effort and verbosity. A non-lite model sends an empty tools array and parallel_tool_calls true. Responses Lite (gpt-5.6-sol) omits tools, sets parallel_tool_calls false, sets reasoning.context all_turns, and sends x-openai-internal-codex-responses-lite. Session telemetry a live CLI adds from its login (client_metadata, prompt_cache_key, item ids, base instructions, and the built-in tool list) is not in this turn because the client request only supplies the user message. Re-record with cargo run --bin traffic-record."
+    "note": "Source-derived, not a packet capture. Fields follow ResponsesApiRequest and build_responses_request at the pinned commit: stream true, store false, tool_choice auto, include reasoning.encrypted_content, input items typed as messages, and the bundled models.json reasoning effort and verbosity. A non-lite model sends an empty tools array and parallel_tool_calls true. Responses Lite (gpt-5.6-sol) omits tools, sets parallel_tool_calls false, sets reasoning.context all_turns, and sends x-openai-internal-codex-responses-lite. Session telemetry a live CLI adds from its login (client_metadata, item ids, base instructions, and the built-in tool list) is not in this turn because the client request only supplies the user message. prompt_cache_key is the session id, which infer supplies. Re-record with cargo run --bin traffic-record."
   },
   "client": {
     "method": "POST",
@@ -43,10 +43,13 @@
         "headers": {
           "accept": "text/event-stream",
           "content-type": "application/json",
-          "originator": "codex_cli_rs",
+          "originator": "codex_exec",
           "session-id": "00000000-0000-4000-8000-000000000001",
           "thread-id": "00000000-0000-4000-8000-000000000001",
+          "version": "0.169.0",
           "x-client-request-id": "00000000-0000-4000-8000-000000000001",
+          "x-codex-routing-hint": "model=gpt-5.6-sol",
+          "x-codex-window-id": "00000000-0000-4000-8000-000000000001:0",
           "x-openai-internal-codex-responses-lite": "true"
         },
         "body": {
@@ -76,7 +79,8 @@
             "verbosity": "low"
           },
           "stream": true,
-          "store": false
+          "store": false,
+          "prompt_cache_key": "00000000-0000-4000-8000-000000000001"
         }
       },
       "response": {

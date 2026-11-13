@@ -616,11 +616,18 @@ async fn inference(State(app): State<App>, request: Request) -> Response {
                 Err(error) => return reject(&writer, &id, error.status, &error.message).await,
             }
         };
-        let prepared = match swap_infer_files(&app, name, provider, &parts.headers, prepared).await
-        {
-            Ok(prepared) => prepared,
-            Err(error) => return reject(&writer, &id, error.status, &error.message).await,
-        };
+        let mut prepared =
+            match swap_infer_files(&app, name, provider, &parts.headers, prepared).await {
+                Ok(prepared) => prepared,
+                Err(error) => return reject(&writer, &id, error.status, &error.message).await,
+            };
+        let codex_headers = (provider.kind == crate::config::Kind::Codex && prepared.rewritten)
+            .then(|| crate::backend::codex_outbound_headers(&parts.headers));
+        if let Some(headers) = &codex_headers {
+            let bytes = std::mem::replace(&mut prepared.bytes, Bytes::new());
+            prepared.bytes = crate::backend::ensure_codex_cache_key(bytes, headers);
+        }
+        let request_headers = codex_headers.as_ref().unwrap_or(&parts.headers);
         if prepared.rewritten
             && let Some(w) = writer.lock().await.as_mut()
             && w.upstream_request(&prepared.bytes).await.is_err()
@@ -639,17 +646,19 @@ async fn inference(State(app): State<App>, request: Request) -> Response {
         };
         let outgoing_length = prepared.bytes.len() as u64;
         let started = std::time::Instant::now();
+        let codex_body = codex_headers.as_ref().map(|_| prepared.bytes.clone());
         let upstream = send(
             &app,
             name,
             provider,
             &parts.method,
             url,
-            &parts.headers,
+            request_headers,
             reqwest::Body::from(prepared.bytes),
             Some(outgoing_length),
             prepared.rewritten,
             codex_lite && prepared.rewritten,
+            codex_body,
             &writer,
         )
         .await;
@@ -768,6 +777,7 @@ async fn inference(State(app): State<App>, request: Request) -> Response {
         length,
         false,
         false,
+        None,
         &writer,
     )
     .await;
@@ -1058,6 +1068,7 @@ async fn send(
     length: Option<u64>,
     rewritten: bool,
     codex_lite: bool,
+    codex_body: Option<Bytes>,
     writer: &Writer,
 ) -> Result<reqwest::Response> {
     let mut headers = filtered_headers(incoming, true);
@@ -1087,6 +1098,9 @@ async fn send(
         );
     }
     crate::backend::get(provider.kind).prepare_headers(&mut headers, rewritten);
+    if let Some(body) = &codex_body {
+        crate::backend::stamp_codex_headers(&mut headers, body);
+    }
     if codex_lite {
         headers.insert(
             "x-openai-internal-codex-responses-lite",
@@ -1125,7 +1139,7 @@ async fn codex_model_list(
     let url = crate::codex_models::models_url(&provider.base_url);
     if let Some(ids) = app.codex_models.fresh_ids(name) {
         if let Some(w) = writer.lock().await.as_mut()
-            && w.route(name, &url, json!({"originator": ["codex_cli_rs"]}))
+            && w.route(name, &url, json!({"originator": ["codex_exec"]}))
                 .await
                 .is_err()
         {
@@ -1204,7 +1218,7 @@ async fn discover_codex_models(
         .await
     {
         Ok(mut headers) => {
-            headers.insert("originator", HeaderValue::from_static("codex_cli_rs"));
+            crate::backend::apply_codex_identity(&mut headers);
             headers.insert(
                 http::header::ACCEPT,
                 HeaderValue::from_static("application/json"),
@@ -4189,9 +4203,20 @@ mod tests {
             assert!(upstream.get("instructions").is_none());
             assert_eq!(upstream["input"][0]["type"], "message");
             assert_eq!(upstream["tool_choice"], "auto");
-            assert_eq!(headers["originator"], "codex_cli_rs");
+            assert_eq!(headers["originator"], "codex_exec");
+            assert_eq!(headers["version"], "0.169.0");
+            assert_eq!(headers["user-agent"], "codex_exec/0.169.0");
             assert_eq!(headers["accept"], "text/event-stream");
-            assert!(headers.get("version").is_none());
+            assert_eq!(
+                headers["x-codex-routing-hint"],
+                format!("model={model}").as_str()
+            );
+            let session = headers["session-id"].to_str().unwrap();
+            assert_eq!(
+                headers["x-codex-window-id"],
+                format!("{session}:0").as_str()
+            );
+            assert_eq!(upstream["prompt_cache_key"], session);
             assert!(headers.get("openai-beta").is_none());
             assert_eq!(headers["session-id"], headers["thread-id"]);
             assert!(

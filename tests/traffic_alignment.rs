@@ -218,7 +218,9 @@ async fn codex_upstream_matches_the_cli_fixture() -> Result<()> {
                 fixture.scenario
             );
         }
-        if !text.contains("hello") {
+        // The recorded completion is "Hello!"; the source-derived fixtures use
+        // lowercase. The check is the replayed word, not its capitalization.
+        if !text.to_ascii_lowercase().contains("hello") {
             bail!(
                 "{} client response did not contain the replayed text: {text}",
                 fixture.scenario

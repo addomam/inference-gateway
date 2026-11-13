@@ -64,7 +64,12 @@ impl Harness for Codex {
             "originator",
             "session-id",
             "thread-id",
+            "version",
             "x-client-request-id",
+            "x-codex-routing-hint",
+            // Present when the caller sent client_metadata. Absence is compared.
+            "x-codex-turn-metadata",
+            "x-codex-window-id",
             // Present only for Responses Lite models. Absence is also compared.
             "x-openai-internal-codex-responses-lite",
         ]
@@ -210,12 +215,16 @@ pub fn fixture_from_capture(scenario: &str, exchanges: &[CapturedExchange]) -> R
                 content_encoding: request_coding,
                 body,
             },
-            response: ObservedResponse {
-                status: turn.status,
-                headers: response_headers,
-                content_encoding: response_coding,
-                body: Some(response_body),
-                body_base64: None,
+            response: {
+                let mut response = ObservedResponse {
+                    status: turn.status,
+                    headers: response_headers,
+                    content_encoding: response_coding,
+                    body: Some(response_body),
+                    body_base64: None,
+                };
+                response.label_sse_media_type();
+                response
             },
         });
     }
@@ -394,6 +403,102 @@ mod tests {
         assert_eq!(
             fixture.client.headers["session-id"],
             "00000000-0000-4000-8000-000000000001"
+        );
+    }
+
+    #[test]
+    fn sse_response_without_a_media_type_is_labeled() {
+        let capture = CapturedExchange {
+            method: "POST".into(),
+            path: "/backend-api/codex/responses".into(),
+            query: String::new(),
+            request_headers: serde_json::json!({"originator": "codex_exec"})
+                .as_object()
+                .unwrap()
+                .clone(),
+            request_body: serde_json::json!({"model": "gpt-6.1-sol", "stream": true}),
+            request_content_encoding: None,
+            status: 200,
+            response_headers: serde_json::Map::new(),
+            response_body: serde_json::json!(
+                "event: response.output_text.delta\ndata: {\"delta\":\"hello\"}\n\n"
+            ),
+            response_content_encoding: None,
+        };
+        let fixture = fixture_from_capture("chat-turn", &[capture]).unwrap();
+        assert_eq!(
+            fixture.exchanges[0].response.headers["content-type"],
+            "text/event-stream"
+        );
+        let json_body = CapturedExchange {
+            method: "POST".into(),
+            path: "/responses".into(),
+            query: String::new(),
+            request_headers: serde_json::Map::new(),
+            request_body: serde_json::json!({"model": "gpt-6.1-sol"}),
+            request_content_encoding: None,
+            status: 200,
+            response_headers: serde_json::Map::new(),
+            response_body: serde_json::json!(r#"{"output":"hello"}"#),
+            response_content_encoding: None,
+        };
+        let fixture = fixture_from_capture("chat-turn", &[json_body]).unwrap();
+        assert!(
+            fixture.exchanges[0]
+                .response
+                .headers
+                .get("content-type")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn load_fixture_labels_sse_without_rewriting_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("turn.json");
+        let raw = serde_json::json!({
+            "harness": "codex",
+            "scenario": "chat-turn",
+            "provenance": "recorded",
+            "source": {
+                "repository": "openai/codex",
+                "commit": SOURCE_COMMIT,
+                "release": RELEASE,
+                "release_commit": RELEASE_COMMIT,
+                "note": "unit"
+            },
+            "client": {
+                "method": "POST",
+                "path": "/v1/responses",
+                "headers": {},
+                "body": {"stream": true}
+            },
+            "exchanges": [{
+                "request": {
+                    "method": "POST",
+                    "path": "/responses",
+                    "headers": {},
+                    "body": {"stream": true}
+                },
+                "response": {
+                    "status": 200,
+                    "headers": {},
+                    "body": "event: response.output_text.delta\ndata: {\"delta\":\"hello\"}\n\n"
+                }
+            }]
+        });
+        std::fs::write(&path, serde_json::to_vec(&raw).unwrap()).unwrap();
+        let fixture = crate::traffic::load_fixture(&path).unwrap();
+        assert_eq!(
+            fixture.exchanges[0].response.headers["content-type"],
+            "text/event-stream"
+        );
+        let on_disk: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert!(
+            on_disk["exchanges"][0]["response"]["headers"]
+                .get("content-type")
+                .is_none()
         );
     }
 

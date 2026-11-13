@@ -3012,9 +3012,14 @@ async fn codex_chat_completion_keeps_the_model_and_omits_rejected_fields() -> Re
         assert_eq!(body["choices"][0]["message"]["content"], "hello", "{model}");
         let received = fixture.received().await?;
         assert_eq!(received.path, "/backend-api/codex/responses");
-        assert_eq!(received.headers["originator"], "codex_cli_rs");
+        assert_eq!(received.headers["originator"], "codex_exec");
         assert_eq!(received.headers["accept"], "text/event-stream");
-        assert!(received.headers.get("version").is_none(), "{model}");
+        assert_eq!(received.headers["version"], "0.169.0", "{model}");
+        assert_eq!(
+            received.headers["x-codex-routing-hint"],
+            format!("model={model}").as_str(),
+            "{model}"
+        );
         assert!(received.headers.get("openai-beta").is_none(), "{model}");
         assert_eq!(
             received.headers["session-id"], received.headers["thread-id"],
@@ -3127,9 +3132,10 @@ async fn codex_models_discovery_is_cached_and_shapes_the_next_completion() -> Re
         "{}",
         discovered.uri
     );
-    assert_eq!(discovered.headers["originator"], "codex_cli_rs");
+    assert_eq!(discovered.headers["originator"], "codex_exec");
     assert_eq!(discovered.headers["chatgpt-account-id"], "account-test");
-    assert!(discovered.headers.get("version").is_none());
+    assert_eq!(discovered.headers["version"], "0.169.0");
+    assert_eq!(discovered.headers["user-agent"], "codex_exec/0.169.0");
     assert!(discovered.headers.get("session-id").is_none());
     assert!(fixture.captured.try_recv().is_err());
 

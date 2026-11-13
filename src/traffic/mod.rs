@@ -119,6 +119,34 @@ impl ObservedResponse {
             _ => bail!("fixture response needs exactly one of body or body_base64"),
         }
     }
+
+    /// A captured Responses body can be SSE with no `content-type`. The CLI
+    /// parses those bytes as events anyway. Replay still needs the media type,
+    /// or a streaming client is handed an unlabeled body.
+    pub fn label_sse_media_type(&mut self) {
+        if self
+            .headers
+            .keys()
+            .any(|name| name.eq_ignore_ascii_case("content-type"))
+        {
+            return;
+        }
+        let Ok(bytes) = self.bytes() else {
+            return;
+        };
+        if is_sse_payload(&bytes) {
+            self.headers.insert(
+                "content-type".to_owned(),
+                Value::String("text/event-stream".to_owned()),
+            );
+        }
+    }
+}
+
+fn is_sse_payload(bytes: &[u8]) -> bool {
+    let bytes = bytes.strip_prefix(b"\xef\xbb\xbf").unwrap_or(bytes);
+    let bytes = bytes.trim_ascii_start();
+    bytes.starts_with(b"data:") || bytes.starts_with(b"event:") || bytes.starts_with(b":")
 }
 
 /// One upstream call observed during replay, before normalization.
@@ -133,7 +161,12 @@ pub struct ActualRequest {
 
 pub fn load_fixture(path: &Path) -> Result<Fixture> {
     let bytes = fs::read(path).with_context(|| format!("read {}", path.display()))?;
-    serde_json::from_slice(&bytes).with_context(|| format!("parse {}", path.display()))
+    let mut fixture: Fixture =
+        serde_json::from_slice(&bytes).with_context(|| format!("parse {}", path.display()))?;
+    for exchange in &mut fixture.exchanges {
+        exchange.response.label_sse_media_type();
+    }
+    Ok(fixture)
 }
 
 pub fn fixtures_in(dir: &Path) -> Result<Vec<(std::path::PathBuf, Fixture)>> {
