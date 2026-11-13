@@ -315,15 +315,7 @@ impl Backend for Codex {
     }
     fn prepare_headers(&self, headers: &mut HeaderMap, rewritten: bool) {
         standard_headers(headers, rewritten);
-        headers.insert(
-            "user-agent",
-            HeaderValue::from_static(concat!("infer/", env!("CARGO_PKG_VERSION"))),
-        );
-        // `default_headers` sends this originator. It does not send `version`
-        // or `OpenAI-Beta`; those were gateway inventions.
-        headers.insert("originator", HeaderValue::from_static("codex_cli_rs"));
-        headers.remove("version");
-        headers.remove("openai-beta");
+        apply_codex_identity(headers);
         if rewritten {
             headers.insert(
                 http::header::ACCEPT,
@@ -336,6 +328,126 @@ impl Backend for Codex {
             insert_if_absent(headers, "thread-id", &session);
             insert_if_absent(headers, "x-client-request-id", &session);
         }
+    }
+}
+
+/// `codex exec` sets this originator. `default_headers` alone still says
+/// `codex_cli_rs`; the exec binary overrides it before any request.
+const CODEX_ORIGINATOR: &str = "codex_exec";
+/// Product token only. OS, architecture, terminal, and the parenthetical
+/// suffix come from the machine that ran the CLI and are not invented here.
+const CODEX_USER_AGENT: &str = "codex_exec/0.169.0";
+
+pub(crate) fn apply_codex_identity(headers: &mut HeaderMap) {
+    headers.insert("originator", HeaderValue::from_static(CODEX_ORIGINATOR));
+    headers.insert(
+        "version",
+        HeaderValue::from_static(crate::codex_models::CODEX_CLIENT_VERSION),
+    );
+    headers.insert("user-agent", HeaderValue::from_static(CODEX_USER_AGENT));
+    headers.remove("openai-beta");
+}
+
+/// Fill the session trio the way a new `codex exec` thread does: one id for
+/// `session-id`, `thread-id`, and `x-client-request-id` when the caller omitted them.
+pub(crate) fn codex_outbound_headers(incoming: &HeaderMap) -> HeaderMap {
+    let mut headers = incoming.clone();
+    let session = incoming
+        .get("session-id")
+        .and_then(|value| value.to_str().ok())
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
+        .or_else(|| {
+            incoming
+                .get("thread-id")
+                .and_then(|value| value.to_str().ok())
+                .filter(|value| !value.is_empty())
+                .map(str::to_owned)
+        })
+        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+    for name in ["session-id", "thread-id", "x-client-request-id"] {
+        insert_if_absent(&mut headers, name, &session);
+    }
+    headers
+}
+
+/// The CLI's `prompt_cache_key` is the session id. A caller-supplied key stays.
+pub(crate) fn ensure_codex_cache_key(bytes: bytes::Bytes, headers: &HeaderMap) -> bytes::Bytes {
+    let Some(session) = headers
+        .get("session-id")
+        .and_then(|value| value.to_str().ok())
+        .filter(|value| !value.is_empty())
+    else {
+        return bytes;
+    };
+    let Ok(mut value) = crate::json::from_slice(&bytes) else {
+        return bytes;
+    };
+    let Some(object) = value.as_object_mut() else {
+        return bytes;
+    };
+    if object.contains_key("prompt_cache_key") {
+        return bytes;
+    }
+    object.insert(
+        "prompt_cache_key".to_owned(),
+        Value::String(session.to_owned()),
+    );
+    match serde_json::to_vec(&value) {
+        Ok(encoded) => bytes::Bytes::from(encoded),
+        Err(_) => bytes,
+    }
+}
+
+/// Headers `codex exec` derives from the request: routing hint, window id, and
+/// turn metadata when the caller already put that metadata on the body.
+pub(crate) fn stamp_codex_headers(headers: &mut HeaderMap, body: &[u8]) {
+    let Ok(value) = crate::json::from_slice(body) else {
+        return;
+    };
+    let Some(object) = value.as_object() else {
+        return;
+    };
+    if let Some(model) = object
+        .get("model")
+        .and_then(Value::as_str)
+        .filter(|model| !model.is_empty())
+    {
+        let hint = match object
+            .get("service_tier")
+            .and_then(Value::as_str)
+            .filter(|tier| !tier.is_empty())
+        {
+            Some(tier) => format!("model={model};tier={tier}"),
+            None => format!("model={model}"),
+        };
+        insert_header(headers, "x-codex-routing-hint", &hint);
+    }
+    // exec's window number is 0. A caller-supplied client_metadata window id wins.
+    let supplied = value
+        .pointer("/client_metadata/x-codex-window-id")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty());
+    let derived = headers
+        .get("session-id")
+        .and_then(|value| value.to_str().ok())
+        .filter(|value| !value.is_empty())
+        .map(|session| format!("{session}:0"));
+    if let Some(window) = supplied.or(derived.as_deref()) {
+        insert_header(headers, "x-codex-window-id", window);
+    }
+    if let Some(metadata) = value
+        .pointer("/client_metadata/x-codex-turn-metadata")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+    {
+        insert_header(headers, "x-codex-turn-metadata", metadata);
+    }
+}
+
+fn insert_header(headers: &mut HeaderMap, name: &'static str, value: &str) {
+    if let Ok(value) = HeaderValue::from_str(value) {
+        headers.insert(name, value);
     }
 }
 
@@ -479,12 +591,81 @@ mod tests {
         assert!(body.get("tools").is_none(), "{body}");
         let mut headers = http::HeaderMap::new();
         get(Kind::Codex).prepare_headers(&mut headers, true);
-        assert_eq!(headers["originator"], "codex_cli_rs");
+        assert_eq!(headers["originator"], "codex_exec");
+        assert_eq!(
+            headers["version"],
+            crate::codex_models::CODEX_CLIENT_VERSION
+        );
+        assert_eq!(headers["user-agent"], "codex_exec/0.169.0");
+        assert!(
+            headers["user-agent"]
+                .to_str()
+                .unwrap()
+                .ends_with(crate::codex_models::CODEX_CLIENT_VERSION)
+        );
         assert_eq!(headers["accept"], "text/event-stream");
-        assert!(headers.get("version").is_none());
         assert!(headers.get("openai-beta").is_none());
         assert_eq!(headers["session-id"], headers["thread-id"]);
         assert_eq!(headers["x-client-request-id"], headers["thread-id"]);
+    }
+
+    #[test]
+    fn codex_stamp_derives_routing_window_and_keeps_caller_metadata() {
+        let mut headers = http::HeaderMap::new();
+        headers.insert(
+            "session-id",
+            http::HeaderValue::from_static("00000000-0000-4000-8000-000000000001"),
+        );
+        let body = br#"{"model":"gpt-6.1-sol","service_tier":"priority","client_metadata":{"x-codex-window-id":"00000000-0000-4000-8000-000000000001:0","x-codex-turn-metadata":"{\"model\":\"gpt-6.1-sol\"}"}}"#;
+        stamp_codex_headers(&mut headers, body);
+        assert_eq!(
+            headers["x-codex-routing-hint"],
+            "model=gpt-6.1-sol;tier=priority"
+        );
+        assert_eq!(
+            headers["x-codex-window-id"],
+            "00000000-0000-4000-8000-000000000001:0"
+        );
+        assert_eq!(
+            headers["x-codex-turn-metadata"],
+            "{\"model\":\"gpt-6.1-sol\"}"
+        );
+        let mut plain = http::HeaderMap::new();
+        plain.insert(
+            "session-id",
+            http::HeaderValue::from_static("00000000-0000-4000-8000-000000000001"),
+        );
+        stamp_codex_headers(&mut plain, br#"{"model":"gpt-5.5"}"#);
+        assert_eq!(plain["x-codex-routing-hint"], "model=gpt-5.5");
+        assert_eq!(
+            plain["x-codex-window-id"],
+            "00000000-0000-4000-8000-000000000001:0"
+        );
+        assert!(plain.get("x-codex-turn-metadata").is_none());
+    }
+
+    #[test]
+    fn codex_cache_key_uses_the_session_when_the_caller_omits_it() {
+        let mut headers = http::HeaderMap::new();
+        headers.insert(
+            "session-id",
+            http::HeaderValue::from_static("00000000-0000-4000-8000-000000000001"),
+        );
+        let bytes = ensure_codex_cache_key(
+            bytes::Bytes::from_static(br#"{"model":"gpt-5.5"}"#),
+            &headers,
+        );
+        let value: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            value["prompt_cache_key"],
+            "00000000-0000-4000-8000-000000000001"
+        );
+        let kept = ensure_codex_cache_key(
+            bytes::Bytes::from_static(br#"{"model":"gpt-5.5","prompt_cache_key":"keep"}"#),
+            &headers,
+        );
+        let value: Value = serde_json::from_slice(&kept).unwrap();
+        assert_eq!(value["prompt_cache_key"], "keep");
     }
 
     #[test]

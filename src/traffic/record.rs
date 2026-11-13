@@ -459,6 +459,10 @@ mod tests {
         );
         assert_eq!(exchange.request_body["model"], "gpt-5.5");
         assert_eq!(exchange.status, 200);
+        assert_eq!(
+            exchange.response_headers["content-type"], "text/event-stream",
+            "response content-type must be recorded, not dropped"
+        );
         assert_eq!(exchange.response_body.as_str(), Some("hello stream"));
         let _ = proxy;
     }
