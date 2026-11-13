@@ -120,6 +120,10 @@ async fn record(scenario: String, model: String, prompt: String) -> Result<()> {
         "recorded {} exchange(s) with the official {RELEASE} CLI",
         exchanges.len()
     );
+    println!(
+        "fixture kept {} POST /responses exchange(s); calls that are not POST /responses are omitted",
+        fixture.exchanges.len()
+    );
     println!("raw capture: {}", dir.join("raw.json").display());
     println!("scrubbed fixture: {}", fixture_path.display());
     println!(

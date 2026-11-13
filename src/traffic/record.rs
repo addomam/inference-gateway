@@ -2,12 +2,17 @@
 //!
 //! The official CLI is pointed at this process with its own base URL. The proxy
 //! forwards to the real origin, streams the response back, and keeps the request
-//! and the full response body. It is not used by the replay test.
+//! and the full response body. A `content-encoding` of zstd, gzip, deflate, or
+//! brotli is decoded for the fixture; the original coding stays on the exchange.
+//! The compressed request bytes are what is forwarded. It is not used by the
+//! replay test.
 
 use std::{
     sync::{Arc, Mutex},
     time::Duration,
 };
+
+use super::encoding::{self, BODY_LIMIT, prepare_body, recorded_coding};
 
 use anyhow::{Context, Result};
 use async_stream::stream;
@@ -18,9 +23,7 @@ use axum::{
 };
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
-use serde_json::{Map, Value, json};
-
-const BODY_LIMIT: usize = 32 * 1024 * 1024;
+use serde_json::{Map, Value};
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CapturedExchange {
@@ -29,9 +32,14 @@ pub struct CapturedExchange {
     pub query: String,
     pub request_headers: Map<String, Value>,
     pub request_body: Value,
+    /// Canonical content-coding, after the body was decoded for the fixture.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_content_encoding: Option<String>,
     pub status: u16,
     pub response_headers: Map<String, Value>,
     pub response_body: Value,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub response_content_encoding: Option<String>,
 }
 
 pub struct RecordingProxy {
@@ -101,7 +109,14 @@ async fn record(State(state): State<ProxyState>, request: Request) -> Response {
             .body(Body::from("request body exceeds 32 MiB"))
             .unwrap_or_default();
     };
-    let request_body = body_value(&bytes);
+    // The origin still receives the compressed bytes and the original header.
+    // The fixture stores the decoded body plus the coding.
+    let prepared = prepare_body(
+        &bytes,
+        request_headers
+            .get("content-encoding")
+            .and_then(Value::as_str),
+    );
     let url = if query.is_empty() {
         format!("{}{path}", state.origin)
     } else {
@@ -109,14 +124,23 @@ async fn record(State(state): State<ProxyState>, request: Request) -> Response {
     };
     let upstream_method =
         reqwest::Method::from_bytes(method.as_bytes()).unwrap_or(reqwest::Method::GET);
+    let pending = PendingCapture {
+        method,
+        path,
+        query,
+        request_headers,
+        request_body: prepared.value,
+        request_content_encoding: prepared.coding,
+    };
     let mut builder = state.client.request(upstream_method, &url);
-    for (name, value) in &request_headers {
+    for (name, value) in &pending.request_headers {
         if forward_request_header(name) {
             builder = builder.header(name, value.as_str().unwrap_or_default());
         }
     }
     // The stored response is the uncompressed SSE. The CLI's own Accept-Encoding
     // is still in the capture; it is not forwarded, so the origin does not gzip it.
+    // A content-encoding that arrives anyway is decoded before it is stored.
     builder = builder.header("accept-encoding", "identity");
     let upstream = match builder.body(bytes.to_vec()).send().await {
         Ok(response) => response,
@@ -124,16 +148,7 @@ async fn record(State(state): State<ProxyState>, request: Request) -> Response {
             let message = error.to_string();
             push(
                 &state.captures,
-                CapturedExchange {
-                    method,
-                    path,
-                    query,
-                    request_headers,
-                    request_body,
-                    status: 0,
-                    response_headers: Map::new(),
-                    response_body: Value::String(message.clone()),
-                },
+                pending.exchange(0, Map::new(), Value::String(message.clone()), None),
             );
             return Response::builder()
                 .status(502)
@@ -143,6 +158,22 @@ async fn record(State(state): State<ProxyState>, request: Request) -> Response {
     };
     let status = upstream.status().as_u16();
     let response_headers = headers_json(upstream.headers());
+    if recorded_coding(
+        response_headers
+            .get("content-encoding")
+            .and_then(Value::as_str),
+    )
+    .is_some()
+    {
+        return collect_encoded_response(
+            pending,
+            status,
+            response_headers,
+            upstream,
+            &state.captures,
+        )
+        .await;
+    }
     let recorded_headers = response_headers.clone();
     let (sender, receiver) = tokio::sync::mpsc::channel::<Result<bytes::Bytes, std::io::Error>>(8);
     let captures = Arc::clone(&state.captures);
@@ -167,16 +198,12 @@ async fn record(State(state): State<ProxyState>, request: Request) -> Response {
         }
         push(
             &captures,
-            CapturedExchange {
-                method,
-                path,
-                query,
-                request_headers,
-                request_body,
+            pending.exchange(
                 status,
-                response_headers: recorded_headers,
-                response_body: body_value(&body),
-            },
+                recorded_headers,
+                encoding::body_from_bytes(&body),
+                None,
+            ),
         );
     });
     let body = Body::from_stream(stream! {
@@ -187,10 +214,122 @@ async fn record(State(state): State<ProxyState>, request: Request) -> Response {
             });
         }
     });
+    response_with(status, response_headers, body, None)
+}
+
+struct PendingCapture {
+    method: String,
+    path: String,
+    query: String,
+    request_headers: Map<String, Value>,
+    request_body: Value,
+    request_content_encoding: Option<String>,
+}
+
+impl PendingCapture {
+    fn exchange(
+        self,
+        status: u16,
+        response_headers: Map<String, Value>,
+        response_body: Value,
+        response_content_encoding: Option<String>,
+    ) -> CapturedExchange {
+        CapturedExchange {
+            method: self.method,
+            path: self.path,
+            query: self.query,
+            request_headers: self.request_headers,
+            request_body: self.request_body,
+            request_content_encoding: self.request_content_encoding,
+            status,
+            response_headers,
+            response_body,
+            response_content_encoding,
+        }
+    }
+}
+
+async fn collect_encoded_response(
+    pending: PendingCapture,
+    status: u16,
+    response_headers: Map<String, Value>,
+    upstream: reqwest::Response,
+    captures: &Mutex<Vec<CapturedExchange>>,
+) -> Response {
+    let mut collected = Vec::new();
+    let mut stream = upstream.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        match chunk {
+            Ok(chunk) => {
+                if collected.len().saturating_add(chunk.len()) > BODY_LIMIT {
+                    let message = "response body exceeds 32 MiB".to_owned();
+                    push(
+                        captures,
+                        pending.exchange(
+                            status,
+                            response_headers,
+                            Value::String(message.clone()),
+                            None,
+                        ),
+                    );
+                    return text_response(502, message);
+                }
+                collected.extend_from_slice(&chunk);
+            }
+            Err(error) => {
+                let message = error.to_string();
+                push(
+                    captures,
+                    pending.exchange(
+                        status,
+                        response_headers,
+                        Value::String(message.clone()),
+                        None,
+                    ),
+                );
+                return text_response(502, message);
+            }
+        }
+    }
+    let prepared = prepare_body(
+        &collected,
+        response_headers
+            .get("content-encoding")
+            .and_then(Value::as_str),
+    );
+    let preserve = if prepared.decoded.is_none() {
+        prepared.coding.clone()
+    } else {
+        None
+    };
+    let forward = prepared.decoded.unwrap_or(collected);
+    push(
+        captures,
+        pending.exchange(
+            status,
+            response_headers.clone(),
+            prepared.value,
+            prepared.coding,
+        ),
+    );
+    response_with(
+        status,
+        response_headers,
+        Body::from(forward),
+        preserve.as_deref(),
+    )
+}
+
+fn response_with(
+    status: u16,
+    headers: Map<String, Value>,
+    body: Body,
+    preserve_encoding: Option<&str>,
+) -> Response {
     let mut response = Response::new(body);
     *response.status_mut() =
         axum::http::StatusCode::from_u16(status).unwrap_or(axum::http::StatusCode::BAD_GATEWAY);
-    for (name, value) in response_headers {
+    for (name, value) in headers {
         if forward_response_header(&name)
             && let Ok(header_name) = axum::http::HeaderName::try_from(name)
             && let Ok(header_value) =
@@ -199,7 +338,21 @@ async fn record(State(state): State<ProxyState>, request: Request) -> Response {
             response.headers_mut().insert(header_name, header_value);
         }
     }
+    if let Some(coding) = preserve_encoding
+        && let Ok(value) = axum::http::HeaderValue::try_from(coding)
+    {
+        response
+            .headers_mut()
+            .insert(axum::http::header::CONTENT_ENCODING, value);
+    }
     response
+}
+
+fn text_response(status: u16, message: String) -> Response {
+    Response::builder()
+        .status(status)
+        .body(Body::from(message))
+        .unwrap_or_default()
 }
 
 fn push(captures: &Mutex<Vec<CapturedExchange>>, exchange: CapturedExchange) {
@@ -225,21 +378,6 @@ fn headers_json(headers: &axum::http::HeaderMap) -> Map<String, Value> {
         }
     }
     out
-}
-
-fn body_value(bytes: &[u8]) -> Value {
-    if let Ok(value) = serde_json::from_slice::<Value>(bytes) {
-        return value;
-    }
-    match String::from_utf8(bytes.to_vec()) {
-        Ok(text) => Value::String(text),
-        Err(error) => {
-            use base64::Engine;
-            json!({
-                "base64": base64::engine::general_purpose::STANDARD.encode(error.as_bytes())
-            })
-        }
-    }
 }
 
 fn forward_request_header(name: &str) -> bool {

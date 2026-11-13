@@ -15,6 +15,7 @@ base64 = "0.22"
 bytes = "1"
 chrono = "0.4"
 clap = { version = "4", features = ["derive"] }
+brotli-decompressor = { version = "6", default-features = false, features = ["std"] }
 flate2 = "1"
 futures-util = "0.3"
 http = "1"
@@ -45,5 +46,6 @@ codegen-units = 1
 strip = true
 
 [dev-dependencies]
+brotli = { version = "9", default-features = false, features = ["std"] }
 tokio-tungstenite = { version = "0.26", features = ["rustls-tls-webpki-roots"] }
 futures-util = "0.3"

@@ -6,6 +6,7 @@
 //! upstream call with [`align`]. Recording is a separate manual command.
 
 pub mod codex;
+mod encoding;
 mod harness;
 mod normalize;
 mod record;
@@ -83,6 +84,10 @@ pub struct ObservedRequest {
     #[serde(default)]
     pub query: String,
     pub headers: Map<String, Value>,
+    /// Content-Encoding the client sent. `body` is the decoded JSON, so this
+    /// header is not repeated in `headers`. Absent means the body was not encoded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content_encoding: Option<String>,
     pub body: Value,
 }
 
@@ -90,6 +95,10 @@ pub struct ObservedRequest {
 pub struct ObservedResponse {
     pub status: u16,
     pub headers: Map<String, Value>,
+    /// Content-Encoding the origin sent. `body` is the decoded text.
+    /// Replay does not compare this field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content_encoding: Option<String>,
     /// UTF-8 response body. Mutually exclusive with `body_base64`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub body: Option<String>,
