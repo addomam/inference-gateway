@@ -2,9 +2,13 @@
 //!
 //! The default is strict JSON equality and exact header values. Each function
 //! below is one opt-in allowance. Nothing else is rewritten or dropped.
+//! Request content-encoding is compared. `content_encoding_allowance` is the
+//! only exception.
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use serde_json::{Map, Value};
+
+use super::encoding::{coding_label, decode_coding};
 
 use super::{ActualRequest, ObservedRequest};
 use crate::traffic::Harness;
@@ -55,7 +59,27 @@ pub fn align(
             bail!("header {name}: expected {left:?}, got {right:?}");
         }
     }
-    let actual_body: Value = serde_json::from_slice(&actual.body)
+    let expected_coding = coding_label(expected.content_encoding.as_deref());
+    let actual_coding = coding_label(
+        actual
+            .headers
+            .get("content-encoding")
+            .and_then(Value::as_str),
+    );
+    if expected_coding != actual_coding
+        && !content_encoding_allowance(&expected_coding, &actual_coding)
+    {
+        bail!("content-encoding: expected {expected_coding}, got {actual_coding}");
+    }
+    let decoded_body;
+    let actual_bytes: &[u8] = if actual_coding == "identity" {
+        &actual.body
+    } else {
+        decoded_body = decode_coding(&actual.body, &actual_coding)
+            .with_context(|| format!("upstream content-encoding {actual_coding}"))?;
+        &decoded_body
+    };
+    let actual_body: Value = serde_json::from_slice(actual_bytes)
         .map_err(|_| anyhow::anyhow!("upstream body is not JSON"))?;
     let left = normalize_json(&expected.body, &mut expected_ids);
     let right = normalize_json(&actual_body, &mut actual_ids);
@@ -78,6 +102,15 @@ fn relative_path(path: &str, base: &str) -> String {
         Some(rest) if rest.starts_with('/') => rest.to_owned(),
         _ => path.to_owned(),
     }
+}
+
+// The official Codex CLI compresses POST /responses with zstd. infer rewrites
+// that JSON (`Generation::forces_rewrite`) and `standard_headers` removes
+// content-encoding, so the gateway request is uncompressed. Recorded `zstd`
+// against a missing content-encoding is the only allowed difference. A coding
+// the gateway does send must still equal the fixture.
+fn content_encoding_allowance(expected: &str, actual: &str) -> bool {
+    expected == "zstd" && actual == "identity"
 }
 
 fn header_values(headers: &Map<String, Value>) -> Result<Map<String, Value>> {
@@ -319,6 +352,7 @@ mod tests {
             path: "/responses".into(),
             query: String::new(),
             headers: headers.as_object().unwrap().clone(),
+            content_encoding: None,
             body,
         }
     }
@@ -390,6 +424,59 @@ mod tests {
         live["openai-beta"] = json!("responses=experimental");
         let actual = actual(live, json!({}));
         assert!(align(&harness, &expected, &actual).is_err());
+    }
+
+    #[test]
+    fn content_encoding_is_compared_and_only_cli_zstd_is_waived() {
+        let harness = Sample;
+        let mut expected = request(headers(), json!({"model": "gpt-5.5"}));
+        expected.content_encoding = Some("zstd".into());
+        align(
+            &harness,
+            &expected,
+            &actual(headers(), json!({"model": "gpt-5.5"})),
+        )
+        .unwrap();
+        let mut compressed_headers = headers();
+        compressed_headers["content-encoding"] = json!("zstd");
+        let mut wire = actual(compressed_headers, json!({"model": "gpt-5.5"}));
+        wire.body = zstd::encode_all(wire.body.as_slice(), 1).unwrap();
+        align(&harness, &expected, &wire).unwrap();
+        let mut gzip = headers();
+        gzip["content-encoding"] = json!("gzip");
+        let error = align(
+            &harness,
+            &expected,
+            &actual(gzip, json!({"model": "gpt-5.5"})),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("content-encoding"), "{error}");
+        let plain = request(headers(), json!({"model": "gpt-5.5"}));
+        let mut unexpected = headers();
+        unexpected["content-encoding"] = json!("zstd");
+        let error = align(
+            &harness,
+            &plain,
+            &actual(unexpected, json!({"model": "gpt-5.5"})),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("content-encoding"), "{error}");
+        expected.content_encoding = Some("gzip".into());
+        let error = align(
+            &harness,
+            &expected,
+            &actual(headers(), json!({"model": "gpt-5.5"})),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("content-encoding"), "{error}");
+        expected.content_encoding = Some("zstd".into());
+        let error = align(
+            &harness,
+            &expected,
+            &actual(headers(), json!({"model": "other"})),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("model"), "{error}");
     }
 
     #[test]

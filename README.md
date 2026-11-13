@@ -904,7 +904,7 @@ Provider rejection, model noncompliance and documented translation limits are ob
 
 The replay test checks that a Codex turn through infer produces the same upstream HTTP call the official Codex CLI would send to `https://chatgpt.com/backend-api/codex`. Harnesses are one module each under `src/traffic/`. Codex is the only one implemented. Grok Build and other first-party clients can be added as another module and another `tests/traffic/<harness>/fixtures` directory without changing the comparison code.
 
-`cargo test --locked -- --test-threads=1` replays the committed fixtures. It uses a loopback mock, dummy Codex auth, and no network. The mock returns the fixture's response stream. The test fails if infer's upstream method, path, query, JSON body, or compared headers differ from the fixture after the normalization rules in `src/traffic/normalize.rs`.
+`cargo test --locked -- --test-threads=1` replays the committed fixtures. It uses a loopback mock, dummy Codex auth, and no network. The mock returns the fixture's response stream. The test fails if infer's upstream method, path, query, JSON body, content-encoding, or compared headers differ from the fixture after the normalization rules in `src/traffic/normalize.rs`.
 
 ### What is committed
 
@@ -931,6 +931,8 @@ cargo run --bin traffic-record -- record \
 
 The CLI's built-in OpenAI provider does not accept a `base_url` override (only a catalog URL) and prefers WebSockets. The recorder therefore passes the CLI its own `-c` provider config: provider id `traffic`, display name `OpenAI` (that is what `is_openai()` checks), `base_url` pointed at a local reverse proxy, `wire_api = "responses"`, `requires_openai_auth = true`, and `supports_websockets = false`. The proxy forwards to `https://chatgpt.com` and records method, path, query, headers, body, and the full response while streaming it back. It asks the origin for `Accept-Encoding: identity` so the stored body is the SSE text; the CLI's own request headers are kept as received.
 
+A request or response `content-encoding` of `zstd`, `gzip`, `x-gzip`, `deflate`, or `br` is decoded before the body is stored. JSON is stored as JSON. The original coding is kept on `content_encoding` and removed from the fixture headers, because those headers describe the decoded body. The bytes forwarded to the origin are still the compressed request the CLI sent. `recorded N exchange(s)` counts every proxied call. The fixture keeps only `POST /responses`; model, auth, and telemetry calls are omitted. Extra `POST /responses` turns stay in the file with `compare: false`. A capture can therefore record 3 exchanges and write a fixture with 1.
+
 Raw output stays in gitignored `traffic-recordings/codex/<scenario>/<timestamp>/`:
 
 * `raw.json` still has credentials. Do not commit it.
@@ -947,17 +949,18 @@ cargo run --bin traffic-record -- scrub \
 cargo run --bin traffic-record -- check --fixtures tests/traffic/codex/fixtures
 ```
 
-Scrub removes auth and cookie headers (including `authorization` and `chatgpt-account-id`) and replaces bearer tokens, JWTs, `sk-` keys, email addresses, and long base64 runs with stable placeholders. The check fails if a fixture still contains those shapes. Copy a reviewed `fixture.json` over `tests/traffic/codex/fixtures/<scenario>.json`. The recorder sets `provenance` to `recorded`. Re-record by running `record` again and replacing that file. Extra `POST /responses` turns from the same process are kept with `compare: false`; the replay sends one client request and expects one compared upstream call for each exchange left at `compare: true`.
+Scrub runs on the decoded JSON strings. It removes auth and cookie headers (including `authorization` and `chatgpt-account-id`) and replaces bearer tokens, JWTs, `sk-` keys, email addresses, and long base64 runs inside those strings with stable placeholders. A body that is still an undecoded base64 blob makes `scrub` fail instead of replacing that blob with `<blob>`. The check fails if a fixture still contains those shapes. Copy a reviewed `fixture.json` over `tests/traffic/codex/fixtures/<scenario>.json`. The recorder sets `provenance` to `recorded`. Re-record by running `record` again and replacing that file. The replay sends one client request and expects one compared upstream call for each exchange left at `compare: true`.
 
 For a non-streaming gateway client, edit the copied fixture's `client.body.stream` to `false` and leave the upstream `stream: true`. That is the `chat-turn` shape. For a live body that already matches the CLI, leave `client.body` equal to the captured body so the test checks that infer forwards it.
 
 ### Normalization
 
-Compared headers, including absence: `accept`, `content-type`, `originator`, `session-id`, `thread-id`, `x-client-request-id`, and `x-openai-internal-codex-responses-lite`. `openai-beta` must be absent. Allowances, each commented in `src/traffic/normalize.rs`:
+Compared headers, including absence: `accept`, `content-type`, `originator`, `session-id`, `thread-id`, `x-client-request-id`, and `x-openai-internal-codex-responses-lite`. `openai-beta` must be absent. Request `content-encoding` is compared too: `content_encoding` on the fixture against the header on the gateway request. Absent means `identity`. Allowances, each commented in `src/traffic/normalize.rs`:
 
 * UUIDs, including inside `msg_<uuid>` and `at_<uuid>`, become `<uuid:N>` in first-seen order. The same id keeps the same number, so a split session id still fails.
 * ISO-8601 timestamps become `<timestamp>`.
 * A value that is only an email address becomes `<email>`. Text that merely contains an address is unchanged.
 * `accept` and `content-type` are compared as media types, without charset or boundary parameters.
+* Recorded `zstd` matches a gateway request with no content-encoding. The CLI compresses `POST /responses`, and infer rewrites that JSON and strips the coding. Any other coding must match, including a coding the gateway itself sends.
 
 These headers are not part of the comparison: `authorization` and the other credential headers, `chatgpt-account-id`, `user-agent` (infer sends `infer/<crate version>`; the CLI sends its own agent string), `version` (the OpenAI provider map sets the package version, while `default_headers` does not and infer currently removes it; a raw capture still stores it), and hop-by-hop framing such as `host`, `content-length`, and `accept-encoding`. No other body field is dropped.
