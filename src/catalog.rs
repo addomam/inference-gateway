@@ -431,10 +431,11 @@ const OTHER: &[&str] = &[
     "text-moderation-stable",
 ];
 
-/// `supported_in_api` slugs in the Codex CLI bundled catalog
-/// (`openai/codex` `codex-rs/models-manager/models.json` at
-/// `69231e119bfca0b14453515e97d99688ce1c47c9`). Hidden daybreak ids stay on
-/// their existing records. infer does not rewrite a client model onto this list.
+/// Fallback slugs when ChatGPT model discovery fails. These are the
+/// `supported_in_api` ids in openai/codex `codex-rs/models-manager/models.json`
+/// at `69231e119bfca0b14453515e97d99688ce1c47c9`, excluding hidden daybreak ids
+/// that already have their own records. This is not the account's entitlement.
+/// `GET /v1/models` on a Codex provider uses the account catalog instead.
 pub const CODEX_SUBSCRIPTION_MODELS: &[&str] = &[
     "codex-auto-review",
     "gpt-5.5",

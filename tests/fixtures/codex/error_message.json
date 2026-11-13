@@ -1,0 +1,8 @@
+{
+  "error": {
+    "message": "The 'gpt-5.5' model is not supported when using Codex with a ChatGPT account.",
+    "type": "invalid_request_error",
+    "code": "model_not_found"
+  },
+  "input": "secret-prompt-do-not-log"
+}

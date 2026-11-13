@@ -2,6 +2,7 @@ pub mod auth;
 mod backend;
 mod capabilities;
 mod catalog;
+mod codex_models;
 pub mod config;
 pub mod import;
 mod json;
