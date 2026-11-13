@@ -95,11 +95,13 @@ async fn record(scenario: String, model: String, prompt: String) -> Result<()> {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs();
-    let dir = PathBuf::from("traffic-recordings")
+    // The CLI child uses a temp cwd. Captures stay under the crate root.
+    let dir = recordings_dir()
         .join(codex::CODEX.id())
         .join(&scenario)
         .join(stamp.to_string());
     fs::create_dir_all(&dir)?;
+    let dir = fs::canonicalize(&dir).context("canonicalize traffic recording")?;
     fs::write(dir.join("cli.stdout"), &output.stdout)?;
     fs::write(dir.join("cli.stderr"), &output.stderr)?;
     let exchanges = proxy.exchanges();
@@ -143,8 +145,11 @@ fn scrub_file(raw: &Path, out: &Path, scenario: &str) -> Result<()> {
 
 async fn ensure_cli() -> Result<PathBuf> {
     let filename = package_filename()?;
-    let cache = PathBuf::from("traffic-recordings").join("cache");
+    let cache = cli_cache_dir();
     fs::create_dir_all(&cache)?;
+    // `record` spawns this binary with `current_dir` set to a temp work dir.
+    // Canonicalize so every caller receives a path that does not depend on that cwd.
+    let cache = fs::canonicalize(&cache).context("canonicalize Codex CLI cache")?;
     let archive = cache.join(filename);
     let sums_path = cache.join(PACKAGE_SUMS_NAME);
     let client = reqwest::Client::builder()
@@ -191,7 +196,8 @@ async fn ensure_cli() -> Result<PathBuf> {
             bail!("tar exited {status}");
         }
     }
-    let binary = find_binary(&extracted)?;
+    let binary =
+        fs::canonicalize(find_binary(&extracted)?).context("canonicalize official codex")?;
     let version = Command::new(&binary)
         .arg("--version")
         .output()
@@ -206,4 +212,25 @@ async fn ensure_cli() -> Result<PathBuf> {
     }
     println!("using {} ({RELEASE})", binary.display());
     Ok(binary)
+}
+
+/// `traffic-recordings/` next to this crate, not the process cwd and not a child cwd.
+fn recordings_dir() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("traffic-recordings")
+}
+
+/// Cache directory for the official package. Absolute, from [`recordings_dir`].
+fn cli_cache_dir() -> PathBuf {
+    recordings_dir().join("cache")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cli_cache_dir_is_absolute() {
+        let cache = cli_cache_dir();
+        assert!(cache.is_absolute(), "{}", cache.display());
+    }
 }
