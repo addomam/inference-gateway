@@ -268,15 +268,29 @@ impl Generation for Codex {
         body: &mut Value,
     ) -> Option<&'static str> {
         let object = body.as_object_mut()?;
-        let warning = object
-            .remove("max_output_tokens")
-            .map(|_| "Codex subscription endpoint does not enforce max_output_tokens");
+        // The Codex CLI `ResponsesApiRequest` sends `stream` and `store` and does
+        // not send `instructions`, `max_output_tokens`, `temperature`, or `top_p`.
+        // The model id is left unchanged.
+        let dropped_cap = object.remove("max_output_tokens").is_some()
+            || object.remove("max_tokens").is_some()
+            || object.remove("max_completion_tokens").is_some();
+        let dropped_sampling =
+            object.remove("temperature").is_some() || object.remove("top_p").is_some();
+        if object.get("instructions").is_some_and(Value::is_null) {
+            object.remove("instructions");
+        }
         object.insert("stream".into(), Value::Bool(true));
         object.insert("store".into(), Value::Bool(false));
-        object
-            .entry("instructions")
-            .or_insert(Value::String(String::new()));
-        warning
+        match (dropped_cap, dropped_sampling) {
+            (true, true) => Some(
+                "Codex subscription endpoint rejects max_output_tokens, temperature, and top_p; those fields were omitted",
+            ),
+            (true, false) => Some("Codex subscription endpoint does not enforce max_output_tokens"),
+            (false, true) => Some(
+                "Codex subscription endpoint rejects temperature and top_p; those fields were omitted",
+            ),
+            (false, false) => None,
+        }
     }
     fn upstream_path(&self, _target: Protocol) -> &'static str {
         "/responses"
@@ -303,6 +317,18 @@ impl Backend for Codex {
             "user-agent",
             HeaderValue::from_static(concat!("infer/", env!("CARGO_PKG_VERSION"))),
         );
+        // The CLI default client sends this originator on every ChatGPT backend call.
+        headers.insert("originator", HeaderValue::from_static("codex_cli_rs"));
+        headers.insert(
+            "version",
+            HeaderValue::from_static(env!("CARGO_PKG_VERSION")),
+        );
+        if rewritten {
+            headers.insert(
+                http::header::ACCEPT,
+                HeaderValue::from_static("text/event-stream"),
+            );
+        }
     }
 }
 
@@ -370,6 +396,37 @@ impl Backend for Clairic {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn codex_chat_translation_drops_rejected_fields_and_keeps_the_model() {
+        let generation = get(Kind::Codex).generation().unwrap();
+        for model in ["gpt-4o-mini", "gpt-5-codex", "gpt-5.1-codex"] {
+            let mut body = crate::translate::request(
+                json!({
+                    "model": model,
+                    "messages": [{"role": "user", "content": "ping"}],
+                    "max_tokens": 1,
+                    "temperature": 0
+                }),
+                Protocol::Chat,
+                Protocol::Responses,
+            )
+            .unwrap();
+            let warning = generation.adapt(Protocol::Responses, true, &mut body);
+            assert!(warning.is_some(), "{model}");
+            assert_eq!(body["model"], model);
+            assert_eq!(body["stream"], true);
+            assert_eq!(body["store"], false);
+            assert!(body.get("max_output_tokens").is_none(), "{body}");
+            assert!(body.get("max_tokens").is_none(), "{body}");
+            assert!(body.get("temperature").is_none(), "{body}");
+            assert!(body.get("top_p").is_none(), "{body}");
+            assert!(body.get("instructions").is_none(), "{body}");
+            let input = body["input"].as_array().unwrap();
+            assert!(input.iter().any(|item| item["role"] == "user"), "{body}");
+        }
+    }
 
     #[test]
     fn each_kind_speaks_only_its_profile_dialects() {

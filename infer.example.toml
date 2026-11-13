@@ -84,9 +84,13 @@ auth_file = "/absolute/path/to/.codex/auth.json"
 # An unconfigured prefix stays part of the model id, including during catalog lookup.
 # Typed API kinds never translate to generation. No hidden substitution or
 # automatic provider fallback.
+# Subscription slugs from the Codex CLI bundled catalog (2026-11-13):
+# codex-auto-review, gpt-5.5, gpt-5.6-luna, gpt-5.6-sol, gpt-5.6-terra,
+# gpt-6-astra, gpt-6-luna, gpt-6-sol, gpt-6.1-sol, gpt-6.1-terra.
+# This alias does not rename other client model ids.
 [models.code]
 provider = "chatgpt"
-model = "gpt-5.4"
+model = "gpt-5.5"
 
 [models.local]
 provider = "llama"

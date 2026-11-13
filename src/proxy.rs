@@ -325,12 +325,27 @@ async fn control_no_cache(request: Request, next: Next) -> Response {
     response
 }
 
+fn gateway_error_body(status: StatusCode, message: &str) -> Value {
+    let kind = match status.as_u16() {
+        401 => "authentication_error",
+        403 => "permission_error",
+        404 => "not_found_error",
+        429 => "rate_limit_error",
+        400..=499 => "invalid_request_error",
+        _ => "api_error",
+    };
+    json!({
+        "error": {
+            "message": message,
+            "type": kind,
+            "param": Value::Null,
+            "code": Value::Null
+        }
+    })
+}
+
 fn error_response(status: StatusCode, message: &str, id: Option<&str>) -> Response {
-    let mut response = (
-        status,
-        axum::Json(json!({"type":"error","error":{"type":"proxy_error","message":message}})),
-    )
-        .into_response();
+    let mut response = (status, axum::Json(gateway_error_body(status, message))).into_response();
     if let Some(id) = id {
         response
             .headers_mut()
@@ -409,10 +424,13 @@ async fn finish(writer: &Writer, status: u16, headers: Value, error: Option<Stri
 }
 
 async fn reject(writer: &Writer, id: &str, status: StatusCode, message: &str) -> Response {
-    let bytes = serde_json::to_vec(
-        &json!({"type":"error","error":{"type":"proxy_error","message":message}}),
-    )
-    .unwrap();
+    tracing::info!(
+        trace_id = id,
+        status = status.as_u16(),
+        error_message = %truncate_log(message),
+        "gateway rejected request"
+    );
+    let bytes = serde_json::to_vec(&gateway_error_body(status, message)).unwrap();
     let result = async {
         if let Some(w) = writer.lock().await.as_mut() {
             w.response(&bytes).await?;
@@ -603,6 +621,7 @@ async fn inference(State(app): State<App>, request: Request) -> Response {
             }
         };
         let outgoing_length = prepared.bytes.len() as u64;
+        let started = std::time::Instant::now();
         let upstream = send(
             &app,
             name,
@@ -619,6 +638,15 @@ async fn inference(State(app): State<App>, request: Request) -> Response {
         let upstream = match upstream {
             Ok(response) => response,
             Err(error) => {
+                tracing::info!(
+                    method = %parts.method,
+                    path = parts.uri.path(),
+                    model = %selection.upstream_model,
+                    provider = name,
+                    latency_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+                    error_message = %safe_failure(&error),
+                    "proxied request failed"
+                );
                 return reject(
                     &writer,
                     &id,
@@ -646,6 +674,13 @@ async fn inference(State(app): State<App>, request: Request) -> Response {
             prepared.decision,
             None,
             parts.method == Method::HEAD,
+            ProxiedRequest {
+                method: parts.method.as_str(),
+                path: parts.uri.path(),
+                model: selection.upstream_model.as_str(),
+                provider: name,
+                started,
+            },
         )
         .await;
     }
@@ -696,6 +731,7 @@ async fn inference(State(app): State<App>, request: Request) -> Response {
         }
         stream_state.complete.store(true, Ordering::Release);
     });
+    let started = std::time::Instant::now();
     let upstream = send(
         &app,
         &provider_name,
@@ -729,10 +765,26 @@ async fn inference(State(app): State<App>, request: Request) -> Response {
                 None,
                 Some(upload_state),
                 parts.method == Method::HEAD,
+                ProxiedRequest {
+                    method: parts.method.as_str(),
+                    path: parts.uri.path(),
+                    model: "",
+                    provider: provider_name.as_str(),
+                    started,
+                },
             )
             .await
         }
         Err(error) => {
+            tracing::info!(
+                method = %parts.method,
+                path = parts.uri.path(),
+                model = "",
+                provider = %provider_name,
+                latency_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+                error_message = %safe_failure(&error),
+                "proxied request failed"
+            );
             reject(
                 &writer,
                 &id,
@@ -1029,6 +1081,143 @@ struct ResponseRoute {
     upstream_stream: bool,
 }
 
+const LOG_LIMIT: usize = 200;
+const ERROR_PREVIEW: usize = 4096;
+
+#[derive(Clone, Copy)]
+struct ProxiedRequest<'a> {
+    method: &'a str,
+    path: &'a str,
+    model: &'a str,
+    provider: &'a str,
+    started: std::time::Instant,
+}
+
+#[derive(Debug)]
+struct UpstreamErrorFields {
+    code: String,
+    kind: String,
+    message: String,
+}
+
+fn safe_failure(error: &impl std::fmt::Display) -> String {
+    let text = error.to_string();
+    let lower = text.to_ascii_lowercase();
+    if lower.contains("bearer")
+        || lower.contains("token")
+        || lower.contains("authorization")
+        || lower.contains("api-key")
+        || lower.contains("account")
+    {
+        "upstream request failed".to_owned()
+    } else {
+        truncate_log(&text)
+    }
+}
+
+fn truncate_log(value: &str) -> String {
+    let mut out = String::new();
+    for (index, ch) in value.chars().enumerate() {
+        if index == LOG_LIMIT {
+            out.push('…');
+            break;
+        }
+        out.push(if ch.is_control() { ' ' } else { ch });
+    }
+    out
+}
+
+fn upstream_error_fields(bytes: &[u8]) -> UpstreamErrorFields {
+    let Ok(value) = crate::json::from_slice(bytes) else {
+        return UpstreamErrorFields {
+            code: String::new(),
+            kind: String::new(),
+            message: "upstream error body was not a JSON error object".to_owned(),
+        };
+    };
+    let error = value
+        .get("error")
+        .filter(|item| item.is_object())
+        .unwrap_or(&value);
+    let message = error
+        .get("message")
+        .and_then(Value::as_str)
+        .filter(|text| !text.is_empty())
+        .map(truncate_log)
+        .unwrap_or_else(|| "upstream error did not include error.message".to_owned());
+    let kind = error
+        .get("type")
+        .and_then(Value::as_str)
+        .map(truncate_log)
+        .unwrap_or_default();
+    let code = match error.get("code") {
+        Some(Value::String(value)) => truncate_log(value),
+        Some(Value::Number(value)) => truncate_log(&value.to_string()),
+        _ => String::new(),
+    };
+    UpstreamErrorFields {
+        code,
+        kind,
+        message,
+    }
+}
+
+fn log_proxied(
+    exchange: ProxiedRequest<'_>,
+    status: u16,
+    latency_ms: u64,
+    error: Option<&UpstreamErrorFields>,
+) {
+    if let Some(error) = error {
+        tracing::info!(
+            method = exchange.method,
+            path = exchange.path,
+            model = exchange.model,
+            provider = exchange.provider,
+            upstream_status = status,
+            latency_ms,
+            error_code = %error.code,
+            error_type = %error.kind,
+            error_message = %error.message,
+            "proxied request"
+        );
+    } else {
+        tracing::info!(
+            method = exchange.method,
+            path = exchange.path,
+            model = exchange.model,
+            provider = exchange.provider,
+            upstream_status = status,
+            latency_ms,
+            "proxied request"
+        );
+    }
+}
+
+async fn preview_upstream_error<S>(stream: &mut S) -> (UpstreamErrorFields, Vec<Bytes>)
+where
+    S: Stream<Item = Result<Bytes, reqwest::Error>> + Unpin,
+{
+    let mut replay = Vec::new();
+    let mut preview = Vec::new();
+    while preview.len() < ERROR_PREVIEW {
+        match stream.next().await {
+            Some(Ok(chunk)) => {
+                let room = ERROR_PREVIEW.saturating_sub(preview.len());
+                preview.extend_from_slice(&chunk[..room.min(chunk.len())]);
+                replay.push(chunk);
+                if preview.len() >= ERROR_PREVIEW {
+                    break;
+                }
+            }
+            Some(Err(_)) | None => break,
+        }
+    }
+    (upstream_error_fields(&preview), replay)
+}
+
+type UpstreamChunks = std::pin::Pin<Box<dyn Stream<Item = Result<Bytes, reqwest::Error>> + Send>>;
+
 #[allow(clippy::too_many_arguments)]
 async fn respond(
     app: &App,
@@ -1041,10 +1230,25 @@ async fn respond(
     decision: Option<crate::translate::AnswerPlan>,
     upload_state: Option<Arc<UploadState>>,
     head: bool,
+    exchange: ProxiedRequest<'_>,
 ) -> Response {
     let status = upstream.status();
-    let mut headers = filtered_headers(upstream.headers(), false);
-    let upstream_headers = headers_json(upstream.headers());
+    let latency_ms = u64::try_from(exchange.started.elapsed().as_millis()).unwrap_or(u64::MAX);
+    let raw_headers = upstream.headers().clone();
+    let mut headers = filtered_headers(&raw_headers, false);
+    let upstream_headers = headers_json(&raw_headers);
+    let mut source = upstream.bytes_stream();
+    let (error_fields, replay) = if status.is_success() {
+        (None, Vec::new())
+    } else {
+        let (fields, replay) = preview_upstream_error(&mut source).await;
+        (Some(fields), replay)
+    };
+    log_proxied(exchange, status.as_u16(), latency_ms, error_fields.as_ref());
+    let mut upstream_body: Option<UpstreamChunks> = Some(Box::pin(
+        futures_util::stream::iter(replay.into_iter().map(Ok::<Bytes, reqwest::Error>))
+            .chain(source),
+    ));
     headers.insert("x-infer-trace-id", HeaderValue::from_str(&id).unwrap());
     headers.insert("x-accel-buffering", HeaderValue::from_static("no"));
     if let Some(warning) = warning {
@@ -1058,7 +1262,7 @@ async fn respond(
         // These responses cannot carry a body, so Hyper will never poll a lazy
         // response stream. Commit before returning, including early-upload state.
         if (head || status == StatusCode::NOT_MODIFIED)
-            && let Some(length) = upstream.headers().get("content-length")
+            && let Some(length) = raw_headers.get("content-length")
         {
             headers.insert("content-length", length.clone());
         }
@@ -1091,8 +1295,7 @@ async fn respond(
         *response.headers_mut() = headers;
         return response;
     }
-    let is_sse = upstream
-        .headers()
+    let is_sse = raw_headers
         .get("content-type")
         .and_then(|v| v.to_str().ok())
         .is_some_and(|v| {
@@ -1118,7 +1321,7 @@ async fn respond(
             )
             .await;
         }
-        let mut stream = upstream.bytes_stream();
+        let mut stream = upstream_body.take().expect("upstream body");
         let mut data = Vec::new();
         while let Some(chunk) = stream.next().await {
             let chunk = match chunk {
@@ -1220,7 +1423,7 @@ async fn respond(
             !route.client_stream && (route.upstream_stream || is_sse || conversion.is_some())
         });
     if need_collect {
-        let mut stream = upstream.bytes_stream();
+        let mut stream = upstream_body.take().expect("upstream body");
         let mut data = Vec::new();
         while let Some(chunk) = stream.next().await {
             let chunk = match chunk {
@@ -1354,7 +1557,7 @@ async fn respond(
         Translated(Vec<Bytes>),
     }
     let stream = io_bytes(async_stream::try_stream! {
-        let mut upstream = upstream.bytes_stream();
+        let mut upstream = upstream_body.take().expect("upstream body");
         while let Some(chunk) = upstream.next().await {
             let result: Result<Output> = async {
                 let chunk = chunk.context("upstream response interrupted")?;
@@ -2890,6 +3093,13 @@ mod tests {
                     body_failed: AtomicBool::new(false),
                 })),
                 false,
+                ProxiedRequest {
+                    method: "POST",
+                    path: "/providers/native/early",
+                    model: "",
+                    provider: "native",
+                    started: std::time::Instant::now(),
+                },
             )
             .await;
             assert_eq!(response.status(), StatusCode::INSUFFICIENT_STORAGE);
@@ -2975,6 +3185,13 @@ mod tests {
             None,
             None,
             false,
+            ProxiedRequest {
+                method: "POST",
+                path: "/v1/messages",
+                model: "model",
+                provider: "native",
+                started: std::time::Instant::now(),
+            },
         )
         .await
     }
@@ -3247,5 +3464,305 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(error.contains("503"), "{error}");
+    }
+
+    #[test]
+    fn upstream_error_summary_keeps_code_type_and_message_only() {
+        let body = br#"{"error":{"message":"model is not available","type":"invalid_request_error","code":"model_not_found"},"input":"secret-prompt-do-not-log","authorization":"dummy-access-token-do-not-log"}"#;
+        let fields = upstream_error_fields(body);
+        assert_eq!(fields.message, "model is not available");
+        assert_eq!(fields.kind, "invalid_request_error");
+        assert_eq!(fields.code, "model_not_found");
+        let rendered = format!("{fields:?}");
+        assert!(!rendered.contains("secret-prompt"));
+        assert!(!rendered.contains("dummy-access-token"));
+        let long = format!("m{}", "x".repeat(400));
+        let truncated = upstream_error_fields(
+            serde_json::to_vec(
+                &json!({"error":{"message":long,"type":"invalid_request_error","code":null}}),
+            )
+            .unwrap()
+            .as_slice(),
+        );
+        assert!(truncated.message.chars().count() <= LOG_LIMIT + 1);
+        assert!(truncated.message.ends_with('…'));
+        assert!(truncated.code.is_empty());
+        let opaque = upstream_error_fields(b"not-json-and-not-a-prompt");
+        assert_eq!(
+            opaque.message,
+            "upstream error body was not a JSON error object"
+        );
+        assert!(!opaque.message.contains("not-json"));
+    }
+
+    #[tokio::test]
+    async fn codex_chat_completion_logs_status_without_prompt_token_or_headers() {
+        let events = log_capture();
+        events.lock().unwrap().clear();
+        let directory = tempfile::tempdir().unwrap();
+        let auth_path = directory.path().join("auth.json");
+        std::fs::write(
+            &auth_path,
+            r#"{"tokens":{"access_token":"dummy-access-token-do-not-log","account_id":"acct-do-not-log"}}"#,
+        )
+        .unwrap();
+        let (tx, mut seen) = tokio::sync::mpsc::unbounded_channel();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let backend = Router::new().fallback(move |request: Request| {
+            let tx = tx.clone();
+            async move {
+                let (parts, body) = request.into_parts();
+                let bytes = axum::body::to_bytes(body, usize::MAX).await.unwrap();
+                tx.send((parts.headers.clone(), bytes.clone())).unwrap();
+                let value: Value = serde_json::from_slice(&bytes).unwrap_or(json!({}));
+                if value["model"] == "gpt-4o-mini" {
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        [(
+                            http::header::CONTENT_TYPE,
+                            HeaderValue::from_static("application/json"),
+                        )],
+                        json!({
+                            "error": {
+                                "message": "model is not available",
+                                "type": "invalid_request_error",
+                                "code": "model_not_found"
+                            },
+                            "input": "secret-prompt-do-not-log",
+                            "authorization": "dummy-access-token-do-not-log"
+                        })
+                        .to_string(),
+                    )
+                        .into_response();
+                }
+                (
+                    StatusCode::OK,
+                    [(
+                        http::header::CONTENT_TYPE,
+                        HeaderValue::from_static("text/event-stream"),
+                    )],
+                    concat!(
+                        "event: response.completed\n",
+                        "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"r\",\"status\":\"completed\",\"output\":[{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"pong\"}]}],\"usage\":{}}}\n\n",
+                    ),
+                )
+                    .into_response()
+            }
+        });
+        tokio::spawn(async move {
+            axum::serve(listener, backend).await.unwrap();
+        });
+        let auth = crate::auth::AuthConfig {
+            mode: "codex".into(),
+            auth_file: Some(auth_path),
+            ..crate::auth::AuthConfig::default()
+        };
+        let provider = Provider {
+            kind: Kind::Codex,
+            base_url: format!("http://{address}/backend-api/codex"),
+            auth: auth.clone(),
+            namespace: None,
+            danger_zone_images: false,
+            daybreak: crate::config::DaybreakLevel::Standard,
+        };
+        let config = Config {
+            listen: "127.0.0.1:0".parse().unwrap(),
+            control_listen: "127.0.0.1:1".parse().unwrap(),
+            proxy_token_env: String::new(),
+            control_token_env: String::new(),
+            trace_dir: directory.path().join("traces"),
+            default_provider: "chatgpt".into(),
+            max_request_bytes: 1024 * 1024,
+            max_buffered_response_bytes: 1024 * 1024,
+            connect_timeout_seconds: 2,
+            read_timeout_seconds: 2,
+            providers: BTreeMap::from([("chatgpt".into(), provider)]),
+            models: BTreeMap::new(),
+        };
+        let app = App {
+            traces: TraceStore::open(&config.trace_dir).await.unwrap(),
+            config: Arc::new(config),
+            client: reqwest::Client::builder()
+                .no_proxy()
+                .redirect(reqwest::redirect::Policy::none())
+                .timeout(Duration::from_secs(5))
+                .build()
+                .unwrap(),
+            auth: Arc::new(BTreeMap::from([(
+                "chatgpt".into(),
+                ProviderAuth::new(auth).unwrap(),
+            )])),
+            proxy_token: Arc::new("test-gateway-token".into()),
+        };
+        for model in ["gpt-5.1-codex", "gpt-4o-mini"] {
+            let response = inference(
+                State(app.clone()),
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/v1/chat/completions")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({
+                            "model": model,
+                            "messages": [{"role": "user", "content": "secret-prompt-do-not-log"}],
+                            "max_tokens": 1,
+                            "temperature": 0
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await;
+            let (headers, bytes) = seen.recv().await.unwrap();
+            let upstream: Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(upstream["model"], model);
+            assert_eq!(upstream["stream"], true);
+            assert_eq!(upstream["store"], false);
+            assert!(upstream.get("max_output_tokens").is_none());
+            assert!(upstream.get("temperature").is_none());
+            assert!(upstream.get("instructions").is_none());
+            assert_eq!(headers["originator"], "codex_cli_rs");
+            assert_eq!(headers["accept"], "text/event-stream");
+            assert!(
+                headers["authorization"]
+                    .to_str()
+                    .unwrap()
+                    .contains("dummy-access-token-do-not-log")
+            );
+            let status = response.status();
+            let client_body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            if model == "gpt-4o-mini" {
+                assert_eq!(status, StatusCode::BAD_REQUEST);
+                let value: Value = serde_json::from_slice(&client_body).unwrap();
+                assert_eq!(value["error"]["message"], "model is not available");
+            } else {
+                assert_eq!(status, StatusCode::OK, "{client_body:?}");
+                let value: Value = serde_json::from_slice(&client_body).unwrap();
+                assert_eq!(value["choices"][0]["message"]["content"], "pong");
+            }
+        }
+        let logged = events.lock().unwrap().clone();
+        let rendered = format!("{logged:?}");
+        assert!(!rendered.contains("secret-prompt-do-not-log"), "{rendered}");
+        assert!(
+            !rendered.contains("dummy-access-token-do-not-log"),
+            "{rendered}"
+        );
+        assert!(!rendered.contains("acct-do-not-log"), "{rendered}");
+        let success = logged
+            .iter()
+            .find(|event| {
+                event
+                    .get("model")
+                    .is_some_and(|model| model.contains("gpt-5.1-codex"))
+            })
+            .unwrap_or_else(|| panic!("missing success log in {logged:?}"));
+        assert_eq!(
+            success.get("message").map(String::as_str),
+            Some("proxied request")
+        );
+        assert_eq!(success.get("method").map(String::as_str), Some("POST"));
+        assert_eq!(
+            success.get("path").map(String::as_str),
+            Some("/v1/chat/completions")
+        );
+        assert_eq!(success.get("provider").map(String::as_str), Some("chatgpt"));
+        assert_eq!(
+            success.get("upstream_status").map(String::as_str),
+            Some("200")
+        );
+        assert!(success.get("latency_ms").is_some());
+        assert!(success.get("error_message").is_none());
+        let failure = logged
+            .iter()
+            .find(|event| {
+                event
+                    .get("model")
+                    .is_some_and(|model| model.contains("gpt-4o-mini"))
+            })
+            .unwrap_or_else(|| panic!("missing failure log in {logged:?}"));
+        assert_eq!(
+            failure.get("upstream_status").map(String::as_str),
+            Some("400")
+        );
+        assert_eq!(
+            failure.get("error_code").map(String::as_str),
+            Some("model_not_found")
+        );
+        assert_eq!(
+            failure.get("error_type").map(String::as_str),
+            Some("invalid_request_error")
+        );
+        assert_eq!(
+            failure.get("error_message").map(String::as_str),
+            Some("model is not available")
+        );
+    }
+
+    type CapturedLogs = Arc<std::sync::Mutex<Vec<BTreeMap<String, String>>>>;
+
+    fn log_capture() -> CapturedLogs {
+        static EVENTS: std::sync::OnceLock<CapturedLogs> = std::sync::OnceLock::new();
+        let events = EVENTS
+            .get_or_init(|| Arc::new(std::sync::Mutex::new(Vec::new())))
+            .clone();
+        static INSTALL: std::sync::Once = std::sync::Once::new();
+        let installed = events.clone();
+        INSTALL.call_once(|| {
+            use tracing_subscriber::layer::SubscriberExt;
+            let subscriber = tracing_subscriber::registry().with(LogCapture(installed));
+            tracing::subscriber::set_global_default(subscriber).expect("install log capture");
+        });
+        events
+    }
+
+    struct LogCapture(CapturedLogs);
+
+    struct LogVisitor<'a>(&'a mut BTreeMap<String, String>);
+
+    impl tracing::field::Visit for LogVisitor<'_> {
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            let rendered = format!("{value:?}");
+            let trimmed = rendered
+                .strip_prefix('"')
+                .and_then(|value| value.strip_suffix('"'))
+                .unwrap_or(rendered.as_str());
+            self.0.insert(field.name().to_owned(), trimmed.to_owned());
+        }
+
+        fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+            self.0.insert(field.name().to_owned(), value.to_owned());
+        }
+
+        fn record_u64(&mut self, field: &tracing::field::Field, value: u64) {
+            self.0.insert(field.name().to_owned(), value.to_string());
+        }
+
+        fn record_i64(&mut self, field: &tracing::field::Field, value: i64) {
+            self.0.insert(field.name().to_owned(), value.to_string());
+        }
+    }
+
+    impl<S> tracing_subscriber::Layer<S> for LogCapture
+    where
+        S: tracing::Subscriber + for<'span> tracing_subscriber::registry::LookupSpan<'span>,
+    {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            let mut fields = BTreeMap::new();
+            event.record(&mut LogVisitor(&mut fields));
+            if fields
+                .get("message")
+                .is_some_and(|message| message == "proxied request")
+            {
+                self.0.lock().unwrap().push(fields);
+            }
+        }
     }
 }

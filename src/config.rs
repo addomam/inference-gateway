@@ -375,39 +375,87 @@ impl Config {
         client: catalog::Dialect,
         hit: catalog::Hit,
     ) -> Result<ModelSelection<'_>> {
-        let Some(target) = catalog::target_dialect(client, hit.record.dialects) else {
+        let Some(_) = catalog::target_dialect(client, hit.record.dialects) else {
             bail!(
                 "generation, embeddings, System One, OpenAI Decisions, and Clairic APIs cannot be translated; {} does not speak {client}",
                 hit.upstream_model
             );
         };
-        let mut matches = self.providers.iter().filter(|(_, provider)| {
-            hit.record.families.contains(&provider.kind.family())
-                && provider.kind.dialects().contains(&target)
-                && namespace
-                    .is_none_or(|namespace| provider.namespace.as_deref() == Some(namespace))
-        });
-        let Some((name, _)) = matches.next() else {
-            let where_ = namespace.map_or_else(
-                || "configured providers".to_owned(),
-                |namespace| format!("namespace {namespace}"),
-            );
-            bail!(
-                "generation, embeddings, System One, OpenAI Decisions, and Clairic APIs cannot be translated; {where_} has no {client} provider for {}",
-                hit.upstream_model
-            );
-        };
-        if matches.next().is_some() {
+        let mut selected: Option<(String, u8)> = None;
+        let mut ambiguous = false;
+        for (name, provider) in &self.providers {
+            if !hit.record.families.contains(&provider.kind.family()) {
+                continue;
+            }
+            if namespace.is_some_and(|namespace| provider.namespace.as_deref() != Some(namespace)) {
+                continue;
+            }
+            let Some(rank) =
+                catalog::serve_rank(client, provider.kind.dialects(), hit.record.dialects)
+            else {
+                continue;
+            };
+            match selected {
+                None => selected = Some((name.clone(), rank)),
+                Some((_, current)) if rank < current => {
+                    selected = Some((name.clone(), rank));
+                    ambiguous = false;
+                }
+                Some((_, current)) if rank == current => ambiguous = true,
+                _ => {}
+            }
+        }
+        if ambiguous {
             bail!("model {} is ambiguous for {client}", hit.upstream_model);
         }
-        Ok(ModelSelection {
-            provider: name.as_str(),
+        if let Some((name, _)) = selected {
+            let provider = self
+                .providers
+                .get_key_value(&name)
+                .expect("selected provider")
+                .0
+                .as_str();
+            return Ok(self.selection_from_hit(provider, hit));
+        }
+        if namespace.is_none()
+            && self.providers[&self.default_provider].kind == Kind::Codex
+            && catalog::serve_rank(
+                client,
+                self.providers[&self.default_provider].kind.dialects(),
+                hit.record.dialects,
+            )
+            .is_some()
+        {
+            tracing::warn!(
+                model = %hit.upstream_model,
+                provider = %self.default_provider,
+                "catalog family has no configured provider; forwarding the original model id to the Codex default"
+            );
+            return Ok(self.selection_from_hit(self.default_provider.as_str(), hit));
+        }
+        let where_ = namespace.map_or_else(
+            || "configured providers".to_owned(),
+            |namespace| format!("namespace {namespace}"),
+        );
+        bail!(
+            "generation, embeddings, System One, OpenAI Decisions, and Clairic APIs cannot be translated; {where_} has no {client} provider for {}",
+            hit.upstream_model
+        );
+    }
+
+    fn selection_from_hit<'a>(
+        &'a self,
+        provider: &'a str,
+        hit: catalog::Hit,
+    ) -> ModelSelection<'a> {
+        ModelSelection {
+            provider,
             upstream_model: hit.upstream_model,
             access_program: hit.inject_cyber,
             operations: hit.record.operations.to_vec(),
             operations_declared: true,
             modalities: hit.record.modalities.map(|items| items.to_vec()),
-        })
+        }
     }
 
     fn require_target_dialect(&self, provider_name: &str, client: catalog::Dialect) -> Result<()> {
@@ -558,6 +606,51 @@ mod tests {
             .unwrap();
         assert_eq!(system_one.provider, "decisions");
         assert_eq!(system_one.upstream_model, "gpt-6-luna");
+    }
+
+    #[test]
+    fn codex_default_forwards_chat_models_without_renaming_them() {
+        let raw = "\
+proxy_token_env = \"INFER_PROXY_TOKEN\"
+control_token_env = \"INFER_CONTROL_TOKEN\"
+default_provider = \"chatgpt\"
+[providers.chatgpt]
+kind = \"codex\"
+base_url = \"https://chatgpt.com/backend-api/codex\"
+";
+        let config: Config = toml::from_str(raw).unwrap();
+        config.validate().unwrap();
+        for model in ["gpt-4o-mini", "gpt-5-codex", "gpt-5.1-codex", "gpt-5.5"] {
+            let selection = config
+                .resolve_model(model, catalog::Dialect::Chat)
+                .unwrap_or_else(|error| panic!("{model}: {error}"));
+            assert_eq!(selection.provider, "chatgpt", "{model}");
+            assert_eq!(selection.upstream_model, model, "{model}");
+        }
+
+        let both = "\
+proxy_token_env = \"INFER_PROXY_TOKEN\"
+control_token_env = \"INFER_CONTROL_TOKEN\"
+default_provider = \"chatgpt\"
+[providers.chatgpt]
+kind = \"codex\"
+base_url = \"https://chatgpt.com/backend-api/codex\"
+[providers.openai]
+kind = \"openai\"
+base_url = \"https://api.openai.com\"
+";
+        let config: Config = toml::from_str(both).unwrap();
+        config.validate().unwrap();
+        let api = config
+            .resolve_model("gpt-4o-mini", catalog::Dialect::Chat)
+            .unwrap();
+        assert_eq!(api.provider, "openai");
+        assert_eq!(api.upstream_model, "gpt-4o-mini");
+        let subscription = config
+            .resolve_model("codex-auto-review", catalog::Dialect::Chat)
+            .unwrap();
+        assert_eq!(subscription.provider, "chatgpt");
+        assert_eq!(subscription.upstream_model, "codex-auto-review");
     }
 
     #[test]

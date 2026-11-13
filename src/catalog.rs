@@ -168,6 +168,7 @@ pub struct Hit {
 
 const OPENAI_AND_CODEX: &[Family] = &[Family::Openai, Family::Codex];
 const OPENAI_FAMILY: &[Family] = &[Family::Openai];
+const CODEX_FAMILY: &[Family] = &[Family::Codex];
 const LLAMA_FAMILY: &[Family] = &[Family::Llama];
 const CLOUDFLARE: &[Family] = &[Family::Cloudflare];
 const RESPONSES_AND_DECISIONS: &[Dialect] = &[Dialect::Responses, Dialect::Decisions];
@@ -214,12 +215,17 @@ fn row(
     }
 }
 
-fn cyber(id: &'static str, dialects: &'static [Dialect], programs: &'static [CyberProgram]) -> Row {
+fn cyber(
+    id: &'static str,
+    dialects: &'static [Dialect],
+    programs: &'static [CyberProgram],
+    families: &'static [Family],
+) -> Row {
     Row {
         id,
         dated: true,
         record: ModelRecord {
-            families: OPENAI_FAMILY,
+            families,
             dialects,
             cyber: Some(programs),
             embedding_dimensions: None,
@@ -376,6 +382,7 @@ const GENERATION: &[&str] = &[
     "gpt-5.6-luna",
     "gpt-5.6-sol",
     "gpt-5.6-terra",
+    "gpt-6.1-terra",
     "gpt-oss-120b",
     "gpt-oss-20b",
     "o1",
@@ -424,6 +431,60 @@ const OTHER: &[&str] = &[
     "text-moderation-stable",
 ];
 
+/// `supported_in_api` slugs in the Codex CLI bundled catalog
+/// (`openai/codex` `codex-rs/models-manager/models.json` at
+/// `69231e119bfca0b14453515e97d99688ce1c47c9`). Hidden daybreak ids stay on
+/// their existing records. infer does not rewrite a client model onto this list.
+pub const CODEX_SUBSCRIPTION_MODELS: &[&str] = &[
+    "codex-auto-review",
+    "gpt-5.5",
+    "gpt-5.6-luna",
+    "gpt-5.6-sol",
+    "gpt-5.6-terra",
+    "gpt-6-astra",
+    "gpt-6-luna",
+    "gpt-6-sol",
+    "gpt-6.1-sol",
+    "gpt-6.1-terra",
+];
+
+/// Older Codex slugs still recorded here. They are forwarded unchanged; the
+/// bundled catalog above no longer lists them.
+const CODEX_NAMED_MODELS: &[&str] = &[
+    "codex-mini-latest",
+    "gpt-5-codex",
+    "gpt-5.1-codex",
+    "gpt-5.1-codex-max",
+    "gpt-5.1-codex-mini",
+    "gpt-5.2-codex",
+    "gpt-5.3-codex",
+];
+
+fn generation_families(id: &str) -> &'static [Family] {
+    if CODEX_SUBSCRIPTION_MODELS.contains(&id) || CODEX_NAMED_MODELS.contains(&id) {
+        OPENAI_AND_CODEX
+    } else {
+        OPENAI_FAMILY
+    }
+}
+
+/// `Some(0)` when the provider and the model both speak the client dialect.
+/// `Some(1)` when translation can reach a dialect the model speaks.
+/// `None` when this provider cannot serve the model for that client.
+pub fn serve_rank(client: Dialect, provider: &[Dialect], model: &[Dialect]) -> Option<u8> {
+    let provider_target = target_dialect(client, provider)?;
+    let model_accepts =
+        model.contains(&provider_target) || target_dialect(provider_target, model).is_some();
+    if !model_accepts {
+        return None;
+    }
+    if provider.contains(&client) && model.contains(&client) {
+        Some(0)
+    } else {
+        Some(1)
+    }
+}
+
 fn records() -> impl Iterator<Item = Row> {
     let luna = std::iter::once(Row {
         id: "gpt-6-luna",
@@ -438,19 +499,44 @@ fn records() -> impl Iterator<Item = Row> {
             operations: &[],
         },
     });
-    let generation = GENERATION
-        .iter()
-        .copied()
-        .map(|id| row(id, true, OPENAI_FAMILY, CHAT_AND_RESPONSES_DIALECTS));
+    let generation = GENERATION.iter().copied().map(|id| {
+        row(
+            id,
+            true,
+            generation_families(id),
+            CHAT_AND_RESPONSES_DIALECTS,
+        )
+    });
+    let codex_review = std::iter::once(row(
+        "codex-auto-review",
+        false,
+        CODEX_FAMILY,
+        CHAT_AND_RESPONSES_DIALECTS,
+    ));
     let chat = CHAT
         .iter()
         .copied()
         .map(|id| row(id, true, OPENAI_FAMILY, CHAT_ONLY));
     let responses = [
-        cyber("gpt-6-sol", CHAT_AND_RESPONSES_DIALECTS, BLUE),
-        cyber("gpt-6.1-sol", CHAT_AND_RESPONSES_DIALECTS, BLUE),
-        cyber("gpt-6-astra", CHAT_AND_RESPONSES_DIALECTS, BLUE),
-        cyber("gpt-5.6-cyber", RESPONSES_ONLY, RED),
+        cyber(
+            "gpt-6-sol",
+            CHAT_AND_RESPONSES_DIALECTS,
+            BLUE,
+            OPENAI_AND_CODEX,
+        ),
+        cyber(
+            "gpt-6.1-sol",
+            CHAT_AND_RESPONSES_DIALECTS,
+            BLUE,
+            OPENAI_AND_CODEX,
+        ),
+        cyber(
+            "gpt-6-astra",
+            CHAT_AND_RESPONSES_DIALECTS,
+            BLUE,
+            OPENAI_AND_CODEX,
+        ),
+        cyber("gpt-5.6-cyber", RESPONSES_ONLY, RED, OPENAI_FAMILY),
         row("o1-preview", true, OPENAI_FAMILY, RESPONSES_ONLY),
         row("o3-deep-research", true, OPENAI_FAMILY, RESPONSES_ONLY),
         row("o4-mini-deep-research", true, OPENAI_FAMILY, RESPONSES_ONLY),
@@ -501,6 +587,7 @@ fn records() -> impl Iterator<Item = Row> {
     ];
     let clairic = std::iter::once(row("@cf/cloudflare/clairic", false, CLOUDFLARE, EXTRACTION));
     luna.chain(generation)
+        .chain(codex_review)
         .chain(chat)
         .chain(responses)
         .chain(embeddings)
@@ -879,6 +966,35 @@ mod tests {
         assert_eq!(daybreak.inject_cyber, Some("daybreak_blue"));
         assert!(resolve("gpt-6-sol#daybreak-red").is_err());
         assert!(resolve("gpt-4o#daybreak-blue").is_err());
+    }
+
+    #[test]
+    fn subscription_models_keep_their_ids_and_codex_can_translate_chat() {
+        for id in CODEX_SUBSCRIPTION_MODELS {
+            let record = lookup(id).expect(id);
+            assert!(
+                record.families.contains(&Family::Codex),
+                "{id} is not a Codex-family model"
+            );
+            assert_eq!(resolve(id).unwrap().unwrap().upstream_model, *id);
+        }
+        let mini = lookup("gpt-4o-mini").unwrap();
+        assert_eq!(mini.families, OPENAI_FAMILY);
+        let codex = lookup("gpt-5.1-codex").unwrap();
+        assert!(codex.families.contains(&Family::Codex));
+        assert!(codex.families.contains(&Family::Openai));
+        assert_eq!(
+            serve_rank(Dialect::Chat, RESPONSES, codex.dialects),
+            Some(1)
+        );
+        assert_eq!(
+            serve_rank(Dialect::Chat, CHAT_AND_RESPONSES_DIALECTS, mini.dialects),
+            Some(0)
+        );
+        assert_eq!(
+            serve_rank(Dialect::Embeddings, RESPONSES, mini.dialects),
+            None
+        );
     }
 
     #[test]

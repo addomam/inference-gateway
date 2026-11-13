@@ -2987,3 +2987,85 @@ async fn near_miss_paths_do_not_reach_the_provider() -> Result<()> {
     assert_eq!(captured.path, "/v1/chat/completions");
     Ok(())
 }
+
+#[tokio::test]
+async fn codex_chat_completion_keeps_the_model_and_omits_rejected_fields() -> Result<()> {
+    let auth_root = tempfile::tempdir()?;
+    let auth = valid_codex_auth(auth_root.path())?;
+    let sse = responses_text_stream(None);
+    for model in ["gpt-4o-mini", "gpt-5-codex", "gpt-5.1-codex", "gpt-5.5"] {
+        let mut fixture = Fixture::start(vec![sse_reply(sse.clone())]).await?;
+        let gateway = Gateway::start("codex", &fixture.base, "unused-alias", Some(&auth)).await?;
+        let response = gateway
+            .post(
+                "/v1/chat/completions",
+                &json!({
+                    "model": model,
+                    "messages": [{"role": "user", "content": "ping"}],
+                    "max_tokens": 1,
+                    "temperature": 0
+                }),
+            )
+            .await?;
+        assert_eq!(response.status(), StatusCode::OK, "{model}");
+        let body: Value = response.json().await?;
+        assert_eq!(body["choices"][0]["message"]["content"], "hello", "{model}");
+        let received = fixture.received().await?;
+        assert_eq!(received.path, "/backend-api/codex/responses");
+        assert_eq!(received.headers["originator"], "codex_cli_rs");
+        assert_eq!(received.headers["accept"], "text/event-stream");
+        assert!(
+            received.headers["authorization"]
+                .to_str()?
+                .starts_with("Bearer ")
+        );
+        let upstream: Value = serde_json::from_slice(&received.body)?;
+        assert_eq!(upstream["model"], model);
+        assert_eq!(upstream["stream"], true);
+        assert_eq!(upstream["store"], false);
+        assert!(upstream.get("max_output_tokens").is_none(), "{upstream}");
+        assert!(upstream.get("max_tokens").is_none(), "{upstream}");
+        assert!(upstream.get("temperature").is_none(), "{upstream}");
+        assert!(upstream.get("instructions").is_none(), "{upstream}");
+    }
+
+    let mut fixture = Fixture::start(vec![Reply {
+        status: StatusCode::BAD_REQUEST,
+        content_type: Some("application/json"),
+        headers: vec![],
+        chunks: vec![
+            br#"{"error":{"message":"model is not available","type":"invalid_request_error","code":"model_not_found"},"input":"secret-prompt"}"#
+                .to_vec(),
+        ],
+        gates: None,
+    }])
+    .await?;
+    let gateway = Gateway::start("codex", &fixture.base, "unused-alias", Some(&auth)).await?;
+    let response = gateway
+        .post(
+            "/v1/chat/completions",
+            &json!({"model":"gpt-4o-mini","messages":[{"role":"user","content":"ping"}],"max_tokens":1}),
+        )
+        .await?;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body: Value = response.json().await?;
+    assert_eq!(body["error"]["message"], "model is not available");
+    assert_eq!(body["error"]["code"], "model_not_found");
+    let _ = fixture.received().await?;
+
+    let response = gateway
+        .post(
+            "/v1/chat/completions",
+            &json!({"messages":[{"role":"user","content":"ping"}]}),
+        )
+        .await?;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body: Value = response.json().await?;
+    assert_eq!(body["error"]["type"], "invalid_request_error");
+    assert!(
+        body["error"]["message"].as_str().unwrap().contains("model"),
+        "{body}"
+    );
+    assert!(body.get("type").is_none(), "{body}");
+    Ok(())
+}
