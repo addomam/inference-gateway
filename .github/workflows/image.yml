@@ -4,16 +4,20 @@ on:
   push:
     branches: [main]
   pull_request:
+  workflow_dispatch:
 
 permissions:
   contents: read
+  packages: write
 
 jobs:
   smoke:
     name: kind smoke
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
       - name: Install kind and kubectl
         run: |
           curl -fsSL -o /tmp/kind https://kind.sigs.k8s.io/dl/v0.33.0/kind-linux-amd64
@@ -24,3 +28,40 @@ jobs:
           kubectl version --client
       - name: Build the image and smoke-test it
         run: bash deploy/e2e/smoke.sh
+      - name: Log in to GHCR
+        if: github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && github.ref == 'refs/heads/main')
+        uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Push linux/amd64 image to GHCR
+        if: github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && github.ref == 'refs/heads/main')
+        env:
+          IMAGE: ghcr.io/addomam/inference-gateway
+        run: |
+          set -euo pipefail
+          platform=$(docker image inspect infer:local --format '{{.Os}}/{{.Architecture}}')
+          if [[ "$platform" != "linux/amd64" ]]; then
+            echo "refusing to publish ${platform}" >&2
+            exit 1
+          fi
+          if [[ ! "${GITHUB_SHA}" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "GITHUB_SHA is not a full commit sha" >&2
+            exit 1
+          fi
+          target="${IMAGE}:${GITHUB_SHA}"
+          docker tag infer:local "$target"
+          log=$(mktemp)
+          docker push --platform linux/amd64 "$target" 2>&1 | tee "$log"
+          unique=$(sed -n 's/.*digest: \(sha256:[0-9a-f]\{64\}\).*/\1/p' "$log" | LC_ALL=C sort -u)
+          if [[ ! "$unique" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            echo "docker push did not report one sha256 digest" >&2
+            exit 1
+          fi
+          printf 'published %s@%s\n' "$IMAGE" "$unique"
+          {
+            printf '### Published image\n\n'
+            printf '%s\n\n' "$unique"
+            printf '%s@%s\n' "$IMAGE" "$unique"
+          } >> "$GITHUB_STEP_SUMMARY"
