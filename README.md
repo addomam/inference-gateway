@@ -350,10 +350,10 @@ auth_file = "/absolute/path/to/.codex/auth.json"
 
 [models.code]
 provider = "chatgpt"
-model = "gpt-5.4"
+model = "gpt-5.5"
 ```
 
-Use a model actually available to your Codex account; the example is not an availability guarantee.
+Use a model actually available to your Codex account; the example is not an availability guarantee. The alias does not rewrite other client model ids. The Codex CLI bundled catalog read on 2026-11-13 (`openai/codex` commit `69231e119bfca0b14453515e97d99688ce1c47c9`, `codex-rs/models-manager/models.json`) lists these `supported_in_api` slugs: `codex-auto-review`, `gpt-5.5`, `gpt-5.6-luna`, `gpt-5.6-sol`, `gpt-5.6-terra`, `gpt-6-astra`, `gpt-6-luna`, `gpt-6-sol`, `gpt-6.1-sol`, and `gpt-6.1-terra`. Hidden daybreak ids in that file stay under infer's OpenAI daybreak ceiling. Older Codex slugs still in infer's catalog (`gpt-5-codex`, `gpt-5.1-codex`, `gpt-5.1-codex-mini`, `gpt-5.1-codex-max`, `gpt-5.2-codex`, `gpt-5.3-codex`, `codex-mini-latest`) are forwarded unchanged. infer does not rename a request onto this list.
 
 ```sh
 export ANTHROPIC_BASE_URL=http://127.0.0.1:8080
@@ -400,7 +400,9 @@ A null Chat `stream` is treated as absent (non-streaming); explicit `true` and `
 
 Translated SSE accepts one leading UTF-8 BOM, including when split across network chunks. BOM characters inside content are preserved. Buffered Responses reconstruction and streaming translation both use the SSE event name when the payload omits its type, and reject disagreement between event names and payload types.
 
-**Codex differences:** model-routed requests use `stream=true`, `store=false`; non-streaming clients receive a reconstructed JSON response after upstream completion. Explicit `/providers/chatgpt/responses` passthrough does not rewrite the body: supply these Codex-required fields yourself. The subscription backend does not support an enforceable `max_output_tokens`: infer removes that field on model-routed requests, preserves the original request in the trace and sends `x-infer-warning`. Do not rely on the client token cap for budgeting on this backend. Unsupported sampling/options are not silently removed. Claude Code features and provider protocols change independently; the translated route is not an Anthropic-supported configuration. Live account/CLI compatibility must be verified with your own credentials.
+**Codex differences:** model-routed requests use `stream=true`, `store=false`, and `Accept: text/event-stream`; non-streaming clients receive a reconstructed JSON response after upstream completion. The request also sends `originator: codex_cli_rs` and a `version` header, matching the fields the Codex CLI attaches to `https://chatgpt.com/backend-api/codex/responses`. Authorization remains `Bearer` plus `chatgpt-account-id` from the configured `auth.json`. Explicit `/providers/chatgpt/responses` passthrough does not rewrite the body: supply these Codex-required fields yourself. The CLI's `ResponsesApiRequest` does not send `instructions`, `max_output_tokens`, `temperature`, or `top_p`. Model-routed requests omit `max_output_tokens` / `max_tokens` / `max_completion_tokens`, `temperature`, and `top_p`, preserve the original request in the trace, and send `x-infer-warning` when one of those fields was removed. An empty `instructions` value is not invented; a caller-supplied instructions string is kept. Do not rely on the client token cap or sampling values for budgeting on this backend. The model string is not rewritten. When no provider of a catalog model's family is configured and the default provider is Codex, a generation id such as `gpt-4o-mini` is forwarded unchanged to that default; the subscription backend may still reject it. Claude Code features and provider protocols change independently; the translated route is not an Anthropic-supported configuration. Live account/CLI compatibility must be verified with your own credentials.
+
+Every proxied request is logged at info with method, path, model, provider, upstream status, and latency. A non-2xx response also logs a truncated upstream `error.code`, `error.type`, and `error.message`. The log does not include prompt text, reply text, tokens, or headers. Gateway-originated 4xx responses use an OpenAI error object (`error.message`, `error.type`, `error.param`, `error.code`) and are logged as gateway rejections, so a local 400 is distinct from an upstream 400.
 
 Non-streaming model-routed Codex calls are collected even when the upstream media type is missing or wrong.
 

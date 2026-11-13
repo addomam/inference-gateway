@@ -74,7 +74,7 @@ Recognized routes buffer within their configured request limit before parsing.
 Route preparation resolves model and backend policies.
 It can rewrite aliases, convert protocols, or replace owned-file references with provider IDs.
 The writer stores a separate upstream request when preparation marks the request rewritten.
-`send` records resolved route metadata before the upstream request.
+`send` records resolved route metadata before the upstream request. After the upstream status is known, the proxy logs method, path, model, provider, status, and latency. Non-2xx responses add a truncated upstream error code, type, and message. That line does not include prompt text, reply text, tokens, or headers.
 Header filtering removes gateway credentials and hop-by-hop headers from forwarding.
 Configured provider authentication supplies outgoing credentials.
 
