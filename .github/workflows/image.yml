@@ -6,14 +6,19 @@ on:
   pull_request:
   workflow_dispatch:
 
+# Pull requests run only the smoke job, whose token can read the repository.
+# Main and manual runs repeat that smoke test, archive the tested image, and
+# publish it from a second job. packages: write is only on that second job.
 permissions:
   contents: read
-  packages: write
 
 jobs:
   smoke:
     name: kind smoke
+    if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
@@ -28,15 +33,66 @@ jobs:
           kubectl version --client
       - name: Build the image and smoke-test it
         run: bash deploy/e2e/smoke.sh
+
+  archive:
+    name: kind smoke for publish
+    if: github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && github.ref == 'refs/heads/main')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - name: Install kind and kubectl
+        run: |
+          curl -fsSL -o /tmp/kind https://kind.sigs.k8s.io/dl/v0.33.0/kind-linux-amd64
+          install -m 0755 /tmp/kind /usr/local/bin/kind
+          curl -fsSL -o /tmp/kubectl https://dl.k8s.io/release/v1.32.2/bin/linux/amd64/kubectl
+          install -m 0755 /tmp/kubectl /usr/local/bin/kubectl
+          kind version
+          kubectl version --client
+      - name: Build the image and smoke-test it
+        run: bash deploy/e2e/smoke.sh
+      - name: Save the smoke-tested image
+        env:
+          IMAGE_TAR: ${{ runner.temp }}/infer-local.tar
+        run: docker save -o "$IMAGE_TAR" infer:local
+      - name: Upload the smoke-tested image
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: infer-local
+          path: ${{ runner.temp }}/infer-local.tar
+          if-no-files-found: error
+          retention-days: 1
+          overwrite: true
+
+  publish:
+    name: publish GHCR
+    needs: archive
+    if: needs.archive.result == 'success'
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      packages: write
+    steps:
+      - name: Download the smoke-tested image
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: infer-local
+          path: ${{ runner.temp }}/infer-image
+      - name: Load the smoke-tested image
+        env:
+          IMAGE_TAR: ${{ runner.temp }}/infer-image/infer-local.tar
+        run: docker load -i "$IMAGE_TAR"
       - name: Log in to GHCR
-        if: github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && github.ref == 'refs/heads/main')
         uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
       - name: Push linux/amd64 image to GHCR
-        if: github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && github.ref == 'refs/heads/main')
         env:
           IMAGE: ghcr.io/addomam/inference-gateway
         run: |
