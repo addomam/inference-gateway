@@ -686,6 +686,7 @@ async fn inference(State(app): State<App>, request: Request) -> Response {
                 client_stream: plan.client_stream,
                 include_usage: plan.include_usage,
                 upstream_stream: plan.upstream_stream,
+                forced_sse: plan.forced_sse,
             }),
             prepared.rewritten,
             prepared.warning,
@@ -1350,6 +1351,7 @@ struct ResponseRoute {
     client_stream: bool,
     include_usage: bool,
     upstream_stream: bool,
+    forced_sse: bool,
 }
 
 const LOG_LIMIT: usize = 200;
@@ -1591,6 +1593,130 @@ where
         }
     }
     (upstream_error_fields(&preview), replay)
+}
+
+fn looks_like_responses_sse(bytes: &[u8]) -> bool {
+    let bytes = bytes.strip_prefix(b"\xef\xbb\xbf").unwrap_or(bytes);
+    let bytes = bytes.trim_ascii_start();
+    bytes.starts_with(b"data:") || bytes.starts_with(b"event:") || bytes.starts_with(b":")
+}
+
+fn reported_upstream_model(headers: &HeaderMap) -> Option<String> {
+    for name in ["openai-model", "x-openai-model"] {
+        if let Some(value) = headers.get(name).and_then(|value| value.to_str().ok()) {
+            let value = value.trim();
+            if !value.is_empty() {
+                return Some(value.to_owned());
+            }
+        }
+    }
+    None
+}
+
+fn semantic_status(failure: &translate::UpstreamStreamFailure) -> StatusCode {
+    match failure.code.as_str() {
+        "rate_limit_exceeded"
+        | "slow_down"
+        | "insufficient_quota"
+        | "credit_balance_exhausted"
+        | "organization_spend_limit_exceeded"
+        | "project_spend_limit_exceeded" => StatusCode::TOO_MANY_REQUESTS,
+        "server_is_overloaded" | "policy_capacity_unavailable" => StatusCode::SERVICE_UNAVAILABLE,
+        "context_length_exceeded"
+        | "invalid_prompt"
+        | "model_not_found"
+        | "content_policy_violation" => StatusCode::BAD_REQUEST,
+        _ => match failure.kind.as_str() {
+            "rate_limit_error" => StatusCode::TOO_MANY_REQUESTS,
+            "invalid_request_error" => StatusCode::BAD_REQUEST,
+            "server_error" => StatusCode::INTERNAL_SERVER_ERROR,
+            _ => StatusCode::BAD_GATEWAY,
+        },
+    }
+}
+
+fn error_type_for(status: StatusCode, kind: &str) -> String {
+    if !kind.is_empty() {
+        return kind.to_owned();
+    }
+    match status.as_u16() {
+        401 => "authentication_error",
+        403 => "permission_error",
+        404 => "not_found_error",
+        429 => "rate_limit_error",
+        400..=499 => "invalid_request_error",
+        _ => "api_error",
+    }
+    .to_owned()
+}
+
+async fn semantic_stream_failure(
+    writer: &Writer,
+    id: &str,
+    headers: &mut HeaderMap,
+    upstream_headers: &Value,
+    failure: translate::UpstreamStreamFailure,
+    exchange: ProxiedRequest<'_>,
+) -> Response {
+    let status = semantic_status(&failure);
+    let kind = error_type_for(status, &failure.kind);
+    let code = if failure.code.is_empty() {
+        Value::Null
+    } else {
+        Value::String(failure.code.clone())
+    };
+    let bytes = serde_json::to_vec(&json!({
+        "error": {
+            "message": failure.message,
+            "type": kind,
+            "param": Value::Null,
+            "code": code
+        }
+    }))
+    .unwrap();
+    tracing::info!(
+        trace_id = id,
+        method = exchange.method,
+        path = exchange.path,
+        model = exchange.model,
+        provider = exchange.provider,
+        status = status.as_u16(),
+        error_code = %failure.code,
+        error_type = %kind,
+        error_message = %truncate_log(&failure.message),
+        "gateway rejected request"
+    );
+    headers.insert("content-type", HeaderValue::from_static("application/json"));
+    headers.remove("content-encoding");
+    remove_body_digests(headers);
+    if let Some(writer) = writer.lock().await.as_mut()
+        && writer.response(&bytes).await.is_err()
+    {
+        return error_response(
+            StatusCode::INSUFFICIENT_STORAGE,
+            "trace write failed",
+            Some(id),
+        );
+    }
+    if let Err(error) = finish(
+        writer,
+        status.as_u16(),
+        json!({"client":headers_json(headers),"upstream":upstream_headers}),
+        Some(failure.message),
+    )
+    .await
+    {
+        tracing::error!(trace_id = %id, %error, "trace commit failed");
+        return error_response(
+            StatusCode::INSUFFICIENT_STORAGE,
+            "trace commit failed",
+            Some(id),
+        );
+    }
+    let mut response = Response::new(Body::from(bytes));
+    *response.status_mut() = status;
+    *response.headers_mut() = headers.clone();
+    response
 }
 
 type UpstreamChunks = std::pin::Pin<Box<dyn Stream<Item = Result<Bytes, reqwest::Error>> + Send>>;
@@ -1840,22 +1966,59 @@ async fn respond(
             }
             data.extend_from_slice(&chunk);
         }
-        let result: Result<Value> = (|| {
+        enum Collected {
+            Value(Value),
+            Upstream(translate::UpstreamStreamFailure),
+        }
+        // Codex always requests a Responses stream. A JSON media type can still
+        // carry that SSE body; a real JSON body must stay on the JSON path.
+        let sse_body = is_sse
+            || route
+                .as_ref()
+                .is_some_and(|route| route.forced_sse && looks_like_responses_sse(&data));
+        let result: Result<Collected> = (|| {
             let route = route.as_ref().unwrap();
-            let value = if is_sse {
+            if sse_body
+                && route.client_protocol == Protocol::Chat
+                && route.upstream_protocol == Protocol::Responses
+            {
+                return match translate::chat_from_responses_sse(
+                    &data,
+                    &route.model,
+                    reported_upstream_model(&raw_headers).as_deref(),
+                ) {
+                    Ok(value) => Ok(Collected::Value(value)),
+                    Err(translate::ChatSseError::Upstream(failure)) => {
+                        Ok(Collected::Upstream(failure))
+                    }
+                    Err(translate::ChatSseError::Invalid(error)) => Err(error),
+                };
+            }
+            let value = if sse_body {
                 translate::collect_response_sse(&data, route.client_protocol)?
             } else {
                 crate::json::from_slice(&data)?
             };
-            translate::response(
+            Ok(Collected::Value(translate::response(
                 value,
                 route.upstream_protocol,
                 route.client_protocol,
                 &route.model,
-            )
+            )?))
         })();
         let value = match result {
-            Ok(v) => v,
+            Ok(Collected::Value(value)) => value,
+            Ok(Collected::Upstream(failure)) => {
+                return semantic_stream_failure(
+                    &writer,
+                    &id,
+                    &mut headers,
+                    &upstream_headers,
+                    failure,
+                    exchange,
+                )
+                .await;
+            }
             Err(error) => {
                 return reject(
                     &writer,
@@ -1899,19 +2062,30 @@ async fn respond(
         *response.headers_mut() = headers;
         return response;
     }
-    let mut translator = if status.is_success() && is_sse {
+    let sse_upstream = is_sse || route.as_ref().is_some_and(|route| route.forced_sse);
+    let mut translator = if status.is_success() && sse_upstream {
         conversion.map(|route| {
-            StreamTranslator::new(
+            let mut translator = StreamTranslator::new(
                 route.upstream_protocol,
                 route.client_protocol,
                 route.model.clone(),
                 route.include_usage,
-            )
+            );
+            if route.forced_sse
+                && route.client_protocol == Protocol::Chat
+                && route.upstream_protocol == Protocol::Responses
+            {
+                translator = translator.lenient();
+            }
+            if let Some(model) = reported_upstream_model(&raw_headers) {
+                translator.set_reported_model(model);
+            }
+            translator
         })
     } else {
         None
     };
-    if status.is_success() && conversion.is_some() && !is_sse {
+    if status.is_success() && conversion.is_some() && !sse_upstream {
         return reject(
             &writer,
             &id,
@@ -3557,6 +3731,7 @@ mod tests {
                 client_stream: stream,
                 include_usage: true,
                 upstream_stream: stream,
+                forced_sse: false,
             }),
             false,
             None,
@@ -3914,6 +4089,17 @@ mod tests {
                     )
                         .into_response();
                 }
+                if value["model"] == "gpt-6.1-sol" {
+                    return (
+                        StatusCode::OK,
+                        [(
+                            http::header::CONTENT_TYPE,
+                            HeaderValue::from_static("application/json"),
+                        )],
+                        include_str!("../tests/fixtures/codex/responses_sse_success.txt"),
+                    )
+                        .into_response();
+                }
                 (
                     StatusCode::OK,
                     [(
@@ -4158,6 +4344,57 @@ mod tests {
             "{detail_body}"
         );
         assert!(!detail_message.contains("secret-prompt-do-not-log"));
+
+        let assembled = inference(
+            State(app.clone()),
+            Request::builder()
+                .method(Method::POST)
+                .uri("/v1/chat/completions")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "model": "gpt-6.1-sol",
+                        "messages": [{"role": "user", "content": "secret-prompt-do-not-log"}],
+                        "max_tokens": 1
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(assembled.status(), StatusCode::OK);
+        let assembled_body: Value = serde_json::from_slice(
+            &axum::body::to_bytes(assembled.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(assembled_body["choices"][0]["message"]["content"], "pong");
+        assert_eq!(assembled_body["model"], "gpt-6.1-sol");
+        assert_eq!(assembled_body["choices"][0]["finish_reason"], "stop");
+        let _ = seen.recv().await.unwrap();
+        let logged = events.lock().unwrap().clone();
+        let assembled_log = logged
+            .iter()
+            .find(|event| {
+                event
+                    .get("model")
+                    .is_some_and(|model| model.contains("gpt-6.1-sol"))
+            })
+            .unwrap_or_else(|| panic!("missing assembled log in {logged:?}"));
+        assert_eq!(
+            assembled_log.get("message").map(String::as_str),
+            Some("proxied request")
+        );
+        assert_eq!(
+            assembled_log.get("upstream_status").map(String::as_str),
+            Some("200")
+        );
+        assert!(assembled_log.get("error_message").is_none());
+        let rendered = format!("{logged:?}");
+        assert!(!rendered.contains("secret-prompt-do-not-log"));
+        assert!(!rendered.contains("opaque-reasoning"));
+        assert!(!rendered.contains("hidden thought"));
     }
 
     type CapturedLogs = Arc<std::sync::Mutex<Vec<BTreeMap<String, String>>>>;

@@ -1,0 +1,56 @@
+: Event names and objects follow openai/codex 69231e119bfca0b14453515e97d99688ce1c47c9
+: codex-rs/codex-api/src/sse/responses.rs process_responses_event.
+: response.created, response.output_text.delta, response.output_item.done,
+: response.completed, response.reasoning_text.delta, response.reasoning_summary_text.delta,
+: response.reasoning_summary_part.added, response.metadata, and codex.response.metadata.
+event: response.created
+data: {"type":"response.created","response":{"id":"resp_ok","object":"response","created_at":1763040000,"model":"gpt-6.1-sol","status":"in_progress","output":[]}}
+
+event: response.in_progress
+data: {"type":"response.in_progress","response":{"id":"resp_ok"}}
+
+event: response.output_item.added
+data: {"type":"response.output_item.added","output_index":0,"item":{"id":"rs_ok","type":"reasoning","summary":[],"content":null,"encrypted_content":"opaque-reasoning"}}
+
+event: response.reasoning_summary_part.added
+data: {"type":"response.reasoning_summary_part.added","item_id":"rs_ok","output_index":0,"summary_index":0}
+
+event: response.reasoning_summary_text.delta
+data: {"type":"response.reasoning_summary_text.delta","item_id":"rs_ok","output_index":0,"summary_index":0,"delta":"summary"}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","item_id":"rs_ok","output_index":0,"content_index":0,"delta":"hidden thought"}
+
+event: response.metadata
+data: {"type":"response.metadata","response_id":"resp_ok","metadata":{"type":"ignored"}}
+
+event: codex.response.metadata
+data: {"type":"codex.response.metadata"}
+
+event: response.output_item.done
+data: {"type":"response.output_item.done","output_index":0,"item":{"id":"rs_ok","type":"reasoning","summary":[{"type":"summary_text","text":"summary"}],"encrypted_content":"opaque-reasoning"}}
+
+event: response.output_item.added
+data: {"type":"response.output_item.added","output_index":1,"item":{"id":"msg_ok","type":"message","role":"assistant","status":"in_progress","phase":"final_answer","content":[]}}
+
+event: response.content_part.added
+data: {"type":"response.content_part.added","output_index":1,"content_index":0,"item_id":"msg_ok","part":{"type":"output_text","text":"","annotations":[]}}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","output_index":1,"content_index":0,"delta":"po"}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","output_index":1,"content_index":0,"delta":"ng"}
+
+event: response.output_text.done
+data: {"type":"response.output_text.done","output_index":1,"content_index":0,"text":"pong"}
+
+event: response.content_part.done
+data: {"type":"response.content_part.done","output_index":1,"content_index":0,"part":{"type":"output_text","text":"pong","annotations":[]}}
+
+event: response.output_item.done
+data: {"type":"response.output_item.done","output_index":1,"item":{"id":"msg_ok","type":"message","role":"assistant","status":"completed","phase":"final_answer","content":[{"type":"output_text","text":"pong","annotations":[]}]}}
+
+event: response.completed
+data: {"type":"response.completed","response":{"id":"resp_ok","object":"response","created_at":1763040000,"model":"gpt-6.1-sol","status":"completed","error":null,"output":[{"id":"rs_ok","type":"reasoning","summary":[{"type":"summary_text","text":"summary"}],"encrypted_content":"opaque-reasoning"},{"id":"msg_ok","type":"message","role":"assistant","status":"completed","phase":"final_answer","content":[{"type":"output_text","text":"pong","annotations":[]}]}],"usage":{"input_tokens":5,"output_tokens":2,"total_tokens":7,"input_tokens_details":{"cached_tokens":0},"output_tokens_details":{"reasoning_tokens":1}}}}
+

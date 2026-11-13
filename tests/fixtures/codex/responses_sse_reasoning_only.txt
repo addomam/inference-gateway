@@ -1,0 +1,20 @@
+: Reasoning-only incomplete turn. Event names from openai/codex
+: 69231e119bfca0b14453515e97d99688ce1c47c9 codex-rs/codex-api/src/sse/responses.rs:
+: response.reasoning_text.delta, response.reasoning_summary_text.delta, and
+: response.incomplete (reason other than "interrupted" is terminal).
+: No output_text is emitted. Chat completions report that as finish_reason length.
+event: response.created
+data: {"type":"response.created","response":{"id":"resp_len","object":"response","created_at":1763040001,"model":"gpt-6.1-sol","status":"in_progress","output":[]}}
+
+event: response.output_item.added
+data: {"type":"response.output_item.added","output_index":0,"item":{"id":"rs_len","type":"reasoning","summary":[],"content":null,"encrypted_content":"opaque-reasoning"}}
+
+event: response.reasoning_text.delta
+data: {"type":"response.reasoning_text.delta","item_id":"rs_len","output_index":0,"content_index":0,"delta":"hidden thought"}
+
+event: response.reasoning_summary_text.delta
+data: {"type":"response.reasoning_summary_text.delta","item_id":"rs_len","output_index":0,"summary_index":0,"delta":"summary"}
+
+event: response.incomplete
+data: {"type":"response.incomplete","response":{"id":"resp_len","object":"response","created_at":1763040001,"model":"gpt-6.1-sol","status":"incomplete","incomplete_details":{"reason":"max_output_tokens"},"error":null,"output":[{"id":"rs_len","type":"reasoning","summary":[{"type":"summary_text","text":"summary"}],"content":[{"type":"reasoning_text","text":"hidden thought"}],"encrypted_content":"opaque-reasoning"}],"usage":{"input_tokens":4,"output_tokens":3,"total_tokens":7,"input_tokens_details":{"cached_tokens":1},"output_tokens_details":{"reasoning_tokens":3}}}}
+

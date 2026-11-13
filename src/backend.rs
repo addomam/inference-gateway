@@ -27,6 +27,11 @@ pub trait Generation: Send + Sync {
     fn forces_rewrite(&self) -> bool {
         false
     }
+    /// The upstream answers with a Responses SSE body even when the client did not
+    /// ask for a stream. Codex does this because `ResponsesApiRequest.stream` is true.
+    fn expects_sse(&self) -> bool {
+        false
+    }
 }
 
 pub trait Decisions: Send + Sync {
@@ -294,6 +299,9 @@ impl Generation for Codex {
         "/responses"
     }
     fn forces_rewrite(&self) -> bool {
+        true
+    }
+    fn expects_sse(&self) -> bool {
         true
     }
 }

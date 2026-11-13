@@ -16,7 +16,9 @@ pub enum AnswerPlan {
     SystemOne(SystemOnePlan),
 }
 pub use stream::StreamTranslator;
-pub(crate) use stream::collect_response_sse;
+pub(crate) use stream::{
+    ChatSseError, UpstreamStreamFailure, chat_from_responses_sse, collect_response_sse,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Protocol {
