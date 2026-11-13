@@ -1,5 +1,5 @@
 # Native release build for the builder's architecture.
-# CI builds linux/amd64 and does not push the image.
+# CI builds linux/amd64 and, after the smoke test on main or a manual run, pushes that image to GHCR.
 # An arm64 image is the same Dockerfile on an arm64 builder, or
 # `docker buildx build --platform linux/arm64`; that path is not run in CI.
 FROM rust:1.99.1-bookworm AS build
