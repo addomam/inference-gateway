@@ -268,9 +268,8 @@ impl Generation for Codex {
         body: &mut Value,
     ) -> Option<&'static str> {
         let object = body.as_object_mut()?;
-        // The Codex CLI `ResponsesApiRequest` sends `stream` and `store` and does
-        // not send `instructions`, `max_output_tokens`, `temperature`, or `top_p`.
-        // The model id is left unchanged.
+        // Caps and sampling are not fields of `ResponsesApiRequest`. The rest of
+        // the body is shaped to that struct in `codex_models::shape`.
         let dropped_cap = object.remove("max_output_tokens").is_some()
             || object.remove("max_tokens").is_some()
             || object.remove("max_completion_tokens").is_some();
@@ -279,8 +278,7 @@ impl Generation for Codex {
         if object.get("instructions").is_some_and(Value::is_null) {
             object.remove("instructions");
         }
-        object.insert("stream".into(), Value::Bool(true));
-        object.insert("store".into(), Value::Bool(false));
+        crate::codex_models::shape(object);
         match (dropped_cap, dropped_sampling) {
             (true, true) => Some(
                 "Codex subscription endpoint rejects max_output_tokens, temperature, and top_p; those fields were omitted",
@@ -310,25 +308,35 @@ impl Backend for Codex {
     fn prepare_headers(&self, headers: &mut HeaderMap, rewritten: bool) {
         standard_headers(headers, rewritten);
         headers.insert(
-            "openai-beta",
-            HeaderValue::from_static("responses=experimental"),
-        );
-        headers.insert(
             "user-agent",
             HeaderValue::from_static(concat!("infer/", env!("CARGO_PKG_VERSION"))),
         );
-        // The CLI default client sends this originator on every ChatGPT backend call.
+        // `default_headers` sends this originator. It does not send `version`
+        // or `OpenAI-Beta`; those were gateway inventions.
         headers.insert("originator", HeaderValue::from_static("codex_cli_rs"));
-        headers.insert(
-            "version",
-            HeaderValue::from_static(env!("CARGO_PKG_VERSION")),
-        );
+        headers.remove("version");
+        headers.remove("openai-beta");
         if rewritten {
             headers.insert(
                 http::header::ACCEPT,
                 HeaderValue::from_static("text/event-stream"),
             );
+            // A new root thread uses one id for the session, the thread, and
+            // `x-client-request-id` (`build_session_headers` plus the thread id).
+            let session = uuid::Uuid::new_v4().to_string();
+            insert_if_absent(headers, "session-id", &session);
+            insert_if_absent(headers, "thread-id", &session);
+            insert_if_absent(headers, "x-client-request-id", &session);
         }
+    }
+}
+
+fn insert_if_absent(headers: &mut HeaderMap, name: &'static str, value: &str) {
+    if headers.contains_key(name) {
+        return;
+    }
+    if let Ok(value) = HeaderValue::from_str(value) {
+        headers.insert(name, value);
     }
 }
 
@@ -418,14 +426,57 @@ mod tests {
             assert_eq!(body["model"], model);
             assert_eq!(body["stream"], true);
             assert_eq!(body["store"], false);
+            assert_eq!(body["tool_choice"], "auto");
+            assert_eq!(body["parallel_tool_calls"], true);
+            assert_eq!(body["include"][0], "reasoning.encrypted_content");
             assert!(body.get("max_output_tokens").is_none(), "{body}");
             assert!(body.get("max_tokens").is_none(), "{body}");
             assert!(body.get("temperature").is_none(), "{body}");
             assert!(body.get("top_p").is_none(), "{body}");
             assert!(body.get("instructions").is_none(), "{body}");
+            assert!(body.get("reasoning").is_none(), "{body}");
             let input = body["input"].as_array().unwrap();
-            assert!(input.iter().any(|item| item["role"] == "user"), "{body}");
+            assert_eq!(input[0]["type"], "message");
+            assert_eq!(input[0]["role"], "user");
+            assert_eq!(input[0]["content"][0]["text"], "ping");
         }
+    }
+
+    #[test]
+    fn codex_responses_lite_model_matches_the_cli_request() {
+        let generation = get(Kind::Codex).generation().unwrap();
+        let mut body = crate::translate::request(
+            json!({
+                "model": "gpt-5.6-sol",
+                "messages": [
+                    {"role": "system", "content": "be brief"},
+                    {"role": "user", "content": "ping"}
+                ],
+                "max_tokens": 1
+            }),
+            Protocol::Chat,
+            Protocol::Responses,
+        )
+        .unwrap();
+        generation.adapt(Protocol::Responses, true, &mut body);
+        assert!(body.get("instructions").is_none(), "{body}");
+        assert_eq!(body["input"][0]["type"], "message");
+        assert_eq!(body["input"][0]["role"], "developer");
+        assert_eq!(body["input"][0]["content"][0]["text"], "be brief");
+        assert_eq!(body["input"][1]["role"], "user");
+        assert_eq!(body["parallel_tool_calls"], false);
+        assert_eq!(body["reasoning"]["effort"], "low");
+        assert_eq!(body["reasoning"]["context"], "all_turns");
+        assert_eq!(body["text"]["verbosity"], "low");
+        assert!(body.get("tools").is_none(), "{body}");
+        let mut headers = http::HeaderMap::new();
+        get(Kind::Codex).prepare_headers(&mut headers, true);
+        assert_eq!(headers["originator"], "codex_cli_rs");
+        assert_eq!(headers["accept"], "text/event-stream");
+        assert!(headers.get("version").is_none());
+        assert!(headers.get("openai-beta").is_none());
+        assert_eq!(headers["session-id"], headers["thread-id"]);
+        assert_eq!(headers["x-client-request-id"], headers["thread-id"]);
     }
 
     #[test]

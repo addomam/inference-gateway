@@ -1,0 +1,27 @@
+{
+  "models": [
+    {
+      "slug": "gpt-5.6-sol",
+      "priority": 2,
+      "visibility": "list",
+      "supported_in_api": true,
+      "use_responses_lite": true,
+      "default_reasoning_level": "low",
+      "support_verbosity": true,
+      "default_verbosity": "low",
+      "model_messages": {
+        "instructions_template": "fixture-base-instructions"
+      }
+    },
+    {
+      "slug": "gpt-5.5",
+      "priority": 1,
+      "visibility": "list",
+      "supported_in_api": true,
+      "use_responses_lite": false,
+      "default_reasoning_level": "medium",
+      "support_verbosity": true,
+      "default_verbosity": "low"
+    }
+  ]
+}

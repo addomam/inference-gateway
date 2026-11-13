@@ -1,0 +1,18 @@
+{
+  "detail": [
+    {
+      "type": "missing",
+      "loc": ["body", "input", 0, "type"],
+      "msg": "Field required",
+      "input": {
+        "role": "user",
+        "content": [
+          {
+            "type": "input_text",
+            "text": "secret-prompt-do-not-log"
+          }
+        ]
+      }
+    }
+  ]
+}

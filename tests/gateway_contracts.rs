@@ -3014,6 +3014,12 @@ async fn codex_chat_completion_keeps_the_model_and_omits_rejected_fields() -> Re
         assert_eq!(received.path, "/backend-api/codex/responses");
         assert_eq!(received.headers["originator"], "codex_cli_rs");
         assert_eq!(received.headers["accept"], "text/event-stream");
+        assert!(received.headers.get("version").is_none(), "{model}");
+        assert!(received.headers.get("openai-beta").is_none(), "{model}");
+        assert_eq!(
+            received.headers["session-id"], received.headers["thread-id"],
+            "{model}"
+        );
         assert!(
             received.headers["authorization"]
                 .to_str()?
@@ -3023,10 +3029,24 @@ async fn codex_chat_completion_keeps_the_model_and_omits_rejected_fields() -> Re
         assert_eq!(upstream["model"], model);
         assert_eq!(upstream["stream"], true);
         assert_eq!(upstream["store"], false);
+        assert_eq!(upstream["tool_choice"], "auto");
+        assert_eq!(upstream["input"][0]["type"], "message");
+        assert_eq!(upstream["include"][0], "reasoning.encrypted_content");
         assert!(upstream.get("max_output_tokens").is_none(), "{upstream}");
         assert!(upstream.get("max_tokens").is_none(), "{upstream}");
         assert!(upstream.get("temperature").is_none(), "{upstream}");
         assert!(upstream.get("instructions").is_none(), "{upstream}");
+        if model == "gpt-5.5" {
+            assert_eq!(upstream["parallel_tool_calls"], true);
+            assert_eq!(upstream["reasoning"]["effort"], "medium");
+            assert!(upstream["reasoning"].get("context").is_none(), "{upstream}");
+            assert!(
+                received
+                    .headers
+                    .get("x-openai-internal-codex-responses-lite")
+                    .is_none()
+            );
+        }
     }
 
     let mut fixture = Fixture::start(vec![Reply {
@@ -3067,5 +3087,111 @@ async fn codex_chat_completion_keeps_the_model_and_omits_rejected_fields() -> Re
         "{body}"
     );
     assert!(body.get("type").is_none(), "{body}");
+    Ok(())
+}
+
+#[tokio::test]
+async fn codex_models_discovery_is_cached_and_shapes_the_next_completion() -> Result<()> {
+    let auth_root = tempfile::tempdir()?;
+    let auth = valid_codex_auth(auth_root.path())?;
+    let models: Value = serde_json::from_str(include_str!("fixtures/codex/models.json"))?;
+    let mut fixture = Fixture::start(vec![
+        json_reply(models),
+        sse_reply(responses_text_stream(None)),
+    ])
+    .await?;
+    let gateway = Gateway::start("codex", &fixture.base, "unused-alias", Some(&auth)).await?;
+    let list = |gateway: &Gateway| {
+        gateway
+            .client
+            .get(format!("{}/v1/models", gateway.base))
+            .header("x-infer-key", &gateway.proxy_token)
+            .send()
+    };
+    let listed = list(&gateway).await?;
+    assert_eq!(listed.status(), StatusCode::OK);
+    assert_eq!(listed.headers()["x-infer-models-source"], "discovered");
+    let body: Value = listed.json().await?;
+    assert_eq!(body["data"][0]["id"], "gpt-5.5");
+    assert_eq!(body["data"][1]["id"], "gpt-5.6-sol");
+    assert!(!body.to_string().contains("fixture-base-instructions"));
+    let cached = list(&gateway).await?;
+    assert_eq!(cached.status(), StatusCode::OK);
+    assert_eq!(cached.headers()["x-infer-models-source"], "discovered");
+    let _ = cached.bytes().await?;
+
+    let discovered = fixture.received().await?;
+    assert_eq!(discovered.path, "/backend-api/codex/models");
+    assert!(
+        discovered.uri.contains("client_version=0.169.0"),
+        "{}",
+        discovered.uri
+    );
+    assert_eq!(discovered.headers["originator"], "codex_cli_rs");
+    assert_eq!(discovered.headers["chatgpt-account-id"], "account-test");
+    assert!(discovered.headers.get("version").is_none());
+    assert!(discovered.headers.get("session-id").is_none());
+    assert!(fixture.captured.try_recv().is_err());
+
+    let response = gateway
+        .post(
+            "/v1/chat/completions",
+            &json!({
+                "model": "gpt-5.6-sol",
+                "messages": [{"role": "user", "content": "ping"}],
+                "max_tokens": 1
+            }),
+        )
+        .await?;
+    assert_eq!(response.status(), StatusCode::OK);
+    let sent = fixture.received().await?;
+    assert_eq!(sent.path, "/backend-api/codex/responses");
+    let upstream: Value = serde_json::from_slice(&sent.body)?;
+    assert_eq!(upstream["input"][0]["role"], "developer");
+    assert_eq!(
+        upstream["input"][0]["content"][0]["text"],
+        "fixture-base-instructions"
+    );
+    assert_eq!(upstream["input"][1]["role"], "user");
+    assert_eq!(upstream["input"][1]["content"][0]["text"], "ping");
+    assert_eq!(upstream["parallel_tool_calls"], false);
+    assert_eq!(upstream["reasoning"]["context"], "all_turns");
+    assert!(upstream.get("instructions").is_none(), "{upstream}");
+    assert_eq!(
+        sent.headers["x-openai-internal-codex-responses-lite"],
+        "true"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn codex_models_discovery_failure_falls_back_to_the_static_list() -> Result<()> {
+    let auth_root = tempfile::tempdir()?;
+    let auth = valid_codex_auth(auth_root.path())?;
+    let mut fixture = Fixture::start(vec![Reply {
+        status: StatusCode::BAD_REQUEST,
+        content_type: Some("application/json"),
+        headers: vec![],
+        chunks: vec![include_bytes!("fixtures/codex/error_detail.json").to_vec()],
+        gates: None,
+    }])
+    .await?;
+    let gateway = Gateway::start("codex", &fixture.base, "unused-alias", Some(&auth)).await?;
+    let listed = gateway
+        .client
+        .get(format!("{}/v1/models", gateway.base))
+        .header("x-infer-key", &gateway.proxy_token)
+        .send()
+        .await?;
+    assert_eq!(listed.status(), StatusCode::OK);
+    assert_eq!(listed.headers()["x-infer-models-source"], "static");
+    let body: Value = listed.json().await?;
+    let rendered = body.to_string();
+    assert!(rendered.contains("gpt-5.6-sol"), "{body}");
+    assert!(rendered.contains("gpt-5.5"), "{body}");
+    assert!(!rendered.contains("secret-prompt-do-not-log"), "{body}");
+    assert!(!rendered.contains("fixture-base-instructions"), "{body}");
+    let captured = fixture.received().await?;
+    assert_eq!(captured.path, "/backend-api/codex/models");
     Ok(())
 }

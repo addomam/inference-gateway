@@ -55,6 +55,7 @@ struct App {
     auth: Arc<BTreeMap<String, ProviderAuth>>,
     traces: TraceStore,
     proxy_token: Arc<String>,
+    codex_models: Arc<crate::codex_models::Catalog>,
 }
 
 fn secret(name: &str) -> Result<String> {
@@ -162,6 +163,7 @@ pub async fn serve(config: Config) -> Result<()> {
         auth: Arc::new(auth),
         traces,
         proxy_token: proxy_token.clone(),
+        codex_models: Arc::new(crate::codex_models::Catalog::default()),
     };
     let inference = Router::new()
         .route("/v1/capabilities", get(capabilities))
@@ -581,23 +583,38 @@ async fn inference(State(app): State<App>, request: Request) -> Response {
         let name = selection.provider;
         let provider = &app.config.providers[name];
         let backend = crate::backend::get(provider.kind);
-        let prepared = match route.prepare(
-            backend,
-            parsed,
-            &client_model,
-            &selection.upstream_model,
-            crate::route::RoutePolicy {
-                access_program: selection.access_program,
-                daybreak: provider.daybreak,
-                danger_zone_images: provider.danger_zone_images,
-                operations: &selection.operations,
-                operations_declared: selection.operations_declared,
-                modalities: selection.modalities.clone(),
-            },
-            request_limit,
-        ) {
-            Ok(prepared) => prepared,
-            Err(error) => return reject(&writer, &id, error.status, &error.message).await,
+        let profile = if provider.kind == crate::config::Kind::Codex {
+            app.codex_models.profile(name, &selection.upstream_model)
+        } else {
+            crate::codex_models::ModelProfile {
+                responses_lite: false,
+                reasoning_effort: None,
+                verbosity: None,
+                instructions: None,
+            }
+        };
+        let codex_lite = provider.kind == crate::config::Kind::Codex && profile.responses_lite;
+        let prepared = {
+            let _profile = (provider.kind == crate::config::Kind::Codex)
+                .then(|| crate::codex_models::ActiveProfile::install(profile));
+            match route.prepare(
+                backend,
+                parsed,
+                &client_model,
+                &selection.upstream_model,
+                crate::route::RoutePolicy {
+                    access_program: selection.access_program,
+                    daybreak: provider.daybreak,
+                    danger_zone_images: provider.danger_zone_images,
+                    operations: &selection.operations,
+                    operations_declared: selection.operations_declared,
+                    modalities: selection.modalities.clone(),
+                },
+                request_limit,
+            ) {
+                Ok(prepared) => prepared,
+                Err(error) => return reject(&writer, &id, error.status, &error.message).await,
+            }
         };
         let prepared = match swap_infer_files(&app, name, provider, &parts.headers, prepared).await
         {
@@ -632,6 +649,7 @@ async fn inference(State(app): State<App>, request: Request) -> Response {
             reqwest::Body::from(prepared.bytes),
             Some(outgoing_length),
             prepared.rewritten,
+            codex_lite && prepared.rewritten,
             &writer,
         )
         .await;
@@ -683,6 +701,12 @@ async fn inference(State(app): State<App>, request: Request) -> Response {
             },
         )
         .await;
+    }
+    if provider.kind == crate::config::Kind::Codex
+        && parts.method == Method::GET
+        && suffix == "/v1/models"
+    {
+        return codex_model_list(&app, &provider_name, provider, &writer, &id, &parts.uri).await;
     }
     let url = match upstream_url(provider, &suffix, &parts.uri) {
         Ok(url) => url,
@@ -741,6 +765,7 @@ async fn inference(State(app): State<App>, request: Request) -> Response {
         &parts.headers,
         reqwest::Body::wrap_stream(request_stream),
         length,
+        false,
         false,
         &writer,
     )
@@ -1031,6 +1056,7 @@ async fn send(
     body: reqwest::Body,
     length: Option<u64>,
     rewritten: bool,
+    codex_lite: bool,
     writer: &Writer,
 ) -> Result<reqwest::Response> {
     let mut headers = filtered_headers(incoming, true);
@@ -1060,6 +1086,12 @@ async fn send(
         );
     }
     crate::backend::get(provider.kind).prepare_headers(&mut headers, rewritten);
+    if codex_lite {
+        headers.insert(
+            "x-openai-internal-codex-responses-lite",
+            HeaderValue::from_static("true"),
+        );
+    }
     if let Some(w) = writer.lock().await.as_mut() {
         w.route(name, url.as_str(), headers_json(&headers)).await?;
     }
@@ -1072,6 +1104,245 @@ async fn send(
         .context("provider transport error")
 }
 
+const CODEX_MODELS_BODY_LIMIT: usize = 8 * 1024 * 1024;
+
+struct DiscoveryFailure {
+    status: u16,
+    fields: UpstreamErrorFields,
+}
+
+async fn codex_model_list(
+    app: &App,
+    name: &str,
+    provider: &Provider,
+    writer: &Writer,
+    id: &str,
+    uri: &Uri,
+) -> Response {
+    let started = std::time::Instant::now();
+    let path = uri.path();
+    let url = crate::codex_models::models_url(&provider.base_url);
+    if let Some(ids) = app.codex_models.fresh_ids(name) {
+        if let Some(w) = writer.lock().await.as_mut()
+            && w.route(name, &url, json!({"originator": ["codex_cli_rs"]}))
+                .await
+                .is_err()
+        {
+            return error_response(
+                StatusCode::INSUFFICIENT_STORAGE,
+                "trace write failed",
+                Some(id),
+            );
+        }
+        return respond_model_list(
+            writer,
+            id,
+            path,
+            name,
+            started,
+            &url,
+            200,
+            "discovered",
+            &ids,
+            None,
+        )
+        .await;
+    }
+    match discover_codex_models(app, name, writer, &url).await {
+        Ok(models) => {
+            app.codex_models.store(name, models);
+            let ids = app
+                .codex_models
+                .fresh_ids(name)
+                .unwrap_or_else(crate::codex_models::static_ids);
+            respond_model_list(
+                writer,
+                id,
+                path,
+                name,
+                started,
+                &url,
+                200,
+                "discovered",
+                &ids,
+                None,
+            )
+            .await
+        }
+        Err(failure) => {
+            let (ids, source) = if let Some(ids) = app.codex_models.cached_ids(name) {
+                (ids, "discovered")
+            } else {
+                (crate::codex_models::static_ids(), "static")
+            };
+            respond_model_list(
+                writer,
+                id,
+                path,
+                name,
+                started,
+                &url,
+                failure.status,
+                source,
+                &ids,
+                Some(failure.fields),
+            )
+            .await
+        }
+    }
+}
+
+async fn discover_codex_models(
+    app: &App,
+    name: &str,
+    writer: &Writer,
+    url: &str,
+) -> Result<Vec<crate::codex_models::DiscoveredModel>, DiscoveryFailure> {
+    let headers = match app.auth[name]
+        .headers(&app.client, false, &HeaderMap::new())
+        .await
+    {
+        Ok(mut headers) => {
+            headers.insert("originator", HeaderValue::from_static("codex_cli_rs"));
+            headers.insert(
+                http::header::ACCEPT,
+                HeaderValue::from_static("application/json"),
+            );
+            headers.insert("accept-encoding", HeaderValue::from_static("identity"));
+            headers
+        }
+        Err(error) => {
+            return Err(discovery_failure(0, &safe_failure(&error)));
+        }
+    };
+    if let Some(w) = writer.lock().await.as_mut()
+        && w.route(name, url, headers_json(&headers)).await.is_err()
+    {
+        return Err(discovery_failure(0, "trace write failed"));
+    }
+    let response = match app.client.get(url).headers(headers).send().await {
+        Ok(response) => response,
+        Err(error) => return Err(discovery_failure(0, &safe_failure(&error))),
+    };
+    let status = response.status().as_u16();
+    let mut body = Vec::new();
+    let mut stream = response.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let Ok(chunk) = chunk else {
+            return Err(discovery_failure(status, "models response read failed"));
+        };
+        if body.len().saturating_add(chunk.len()) > CODEX_MODELS_BODY_LIMIT {
+            return Err(discovery_failure(status, "models response exceeded 8 MiB"));
+        }
+        body.extend_from_slice(&chunk);
+    }
+    if !StatusCode::from_u16(status).is_ok_and(|status| status.is_success()) {
+        return Err(DiscoveryFailure {
+            status,
+            fields: upstream_error_fields(&body),
+        });
+    }
+    crate::codex_models::parse_catalog(&body).map_err(|message| discovery_failure(status, &message))
+}
+
+fn discovery_failure(status: u16, message: &str) -> DiscoveryFailure {
+    DiscoveryFailure {
+        status,
+        fields: UpstreamErrorFields {
+            code: String::new(),
+            kind: String::new(),
+            message: truncate_body(message),
+            body: String::new(),
+        },
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn respond_model_list(
+    writer: &Writer,
+    id: &str,
+    path: &str,
+    provider: &str,
+    started: std::time::Instant,
+    url: &str,
+    upstream_status: u16,
+    source: &'static str,
+    ids: &[String],
+    error: Option<UpstreamErrorFields>,
+) -> Response {
+    let bytes = serde_json::to_vec(&crate::codex_models::openai_list(ids)).unwrap_or_default();
+    let latency_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+    if let Some(error) = &error {
+        tracing::info!(
+            method = "GET",
+            path,
+            model = "",
+            provider,
+            upstream_status,
+            latency_ms,
+            models_source = source,
+            upstream_url = url,
+            codex_commit = crate::codex_models::CODEX_SOURCE_COMMIT,
+            codex_release = crate::codex_models::CODEX_RELEASE_COMMIT,
+            error_code = %error.code,
+            error_type = %error.kind,
+            error_message = %error.message,
+            error_body = %error.body,
+            "proxied request"
+        );
+    } else {
+        tracing::info!(
+            method = "GET",
+            path,
+            model = "",
+            provider,
+            upstream_status,
+            latency_ms,
+            models_source = source,
+            upstream_url = url,
+            codex_commit = crate::codex_models::CODEX_SOURCE_COMMIT,
+            codex_release = crate::codex_models::CODEX_RELEASE_COMMIT,
+            "proxied request"
+        );
+    }
+    let stored = async {
+        if let Some(w) = writer.lock().await.as_mut() {
+            w.response(&bytes).await?;
+        }
+        finish(
+            writer,
+            StatusCode::OK.as_u16(),
+            json!({
+                "content-type": ["application/json"],
+                "x-infer-models-source": [source]
+            }),
+            None,
+        )
+        .await
+    }
+    .await;
+    if let Err(error) = stored {
+        tracing::error!(trace_id = id, %error, "failed to persist model list");
+        return error_response(
+            StatusCode::INSUFFICIENT_STORAGE,
+            "trace write failed",
+            Some(id),
+        );
+    }
+    let mut response = Response::new(Body::from(bytes));
+    *response.status_mut() = StatusCode::OK;
+    response.headers_mut().insert(
+        http::header::CONTENT_TYPE,
+        HeaderValue::from_static("application/json"),
+    );
+    if let Ok(source) = HeaderValue::from_str(source) {
+        response
+            .headers_mut()
+            .insert("x-infer-models-source", source);
+    }
+    response
+}
+
 struct ResponseRoute {
     upstream_protocol: Protocol,
     client_protocol: Protocol,
@@ -1082,6 +1353,7 @@ struct ResponseRoute {
 }
 
 const LOG_LIMIT: usize = 200;
+const ERROR_BODY_LOG_LIMIT: usize = 500;
 const ERROR_PREVIEW: usize = 4096;
 
 #[derive(Clone, Copy)]
@@ -1098,6 +1370,8 @@ struct UpstreamErrorFields {
     code: String,
     kind: String,
     message: String,
+    /// Sanitized upstream body, set only when `error.message` is absent.
+    body: String,
 }
 
 fn safe_failure(error: &impl std::fmt::Display) -> String {
@@ -1133,6 +1407,7 @@ fn upstream_error_fields(bytes: &[u8]) -> UpstreamErrorFields {
             code: String::new(),
             kind: String::new(),
             message: "upstream error body was not a JSON error object".to_owned(),
+            body: String::new(),
         };
     };
     let error = value
@@ -1143,23 +1418,124 @@ fn upstream_error_fields(bytes: &[u8]) -> UpstreamErrorFields {
         .get("message")
         .and_then(Value::as_str)
         .filter(|text| !text.is_empty())
-        .map(truncate_log)
-        .unwrap_or_else(|| "upstream error did not include error.message".to_owned());
+        .map(truncate_log);
     let kind = error
         .get("type")
         .and_then(Value::as_str)
         .map(truncate_log)
         .unwrap_or_default();
-    let code = match error.get("code") {
+    let code = match error.get("code").or_else(|| value.get("error_code")) {
         Some(Value::String(value)) => truncate_log(value),
         Some(Value::Number(value)) => truncate_log(&value.to_string()),
         _ => String::new(),
     };
+    if let Some(message) = message {
+        return UpstreamErrorFields {
+            code,
+            kind,
+            message,
+            body: String::new(),
+        };
+    }
+    let detail = detail_text(value.get("detail").or_else(|| error.get("detail")));
     UpstreamErrorFields {
         code,
         kind,
-        message,
+        message: detail
+            .unwrap_or_else(|| "upstream error did not include error.message".to_owned()),
+        body: truncate_body(&sanitize_error_value(&value).to_string()),
     }
+}
+
+fn detail_text(detail: Option<&Value>) -> Option<String> {
+    let detail = detail?;
+    let text = match detail {
+        Value::String(text) if !text.is_empty() => clean_error_string(text),
+        Value::String(_) => return None,
+        other => sanitize_error_value(other).to_string(),
+    };
+    let text = truncate_body(&text);
+    (!text.is_empty()).then_some(text)
+}
+
+fn sanitize_error_value(value: &Value) -> Value {
+    sanitize_error_value_at(value, 0)
+}
+
+fn sanitize_error_value_at(value: &Value, depth: usize) -> Value {
+    if depth > 8 {
+        return Value::String("[omitted]".into());
+    }
+    match value {
+        Value::Object(object) => {
+            let mut kept = serde_json::Map::new();
+            for (key, child) in object {
+                if omit_error_key(key) {
+                    continue;
+                }
+                kept.insert(key.clone(), sanitize_error_value_at(child, depth + 1));
+            }
+            Value::Object(kept)
+        }
+        Value::Array(items) => Value::Array(
+            items
+                .iter()
+                .take(8)
+                .map(|item| sanitize_error_value_at(item, depth + 1))
+                .collect(),
+        ),
+        Value::String(text) => Value::String(clean_error_string(text)),
+        other => other.clone(),
+    }
+}
+
+fn omit_error_key(key: &str) -> bool {
+    matches!(
+        key,
+        "input"
+            | "output"
+            | "messages"
+            | "content"
+            | "prompt"
+            | "text"
+            | "choices"
+            | "completion"
+            | "instructions"
+            | "arguments"
+            | "output_text"
+            | "input_text"
+            | "authorization"
+            | "access_token"
+            | "refresh_token"
+            | "token"
+            | "api_key"
+            | "account_id"
+            | "chatgpt_account_id"
+            | "id_token"
+    )
+}
+
+fn clean_error_string(value: &str) -> String {
+    let lower = value.to_ascii_lowercase();
+    if lower.contains("bearer ") || lower.contains("sk-") {
+        return "[omitted]".to_owned();
+    }
+    value
+        .chars()
+        .map(|ch| if ch.is_control() { ' ' } else { ch })
+        .collect()
+}
+
+fn truncate_body(value: &str) -> String {
+    let mut out = String::new();
+    for (index, ch) in value.chars().enumerate() {
+        if index == ERROR_BODY_LOG_LIMIT {
+            out.push('…');
+            break;
+        }
+        out.push(ch);
+    }
+    out
 }
 
 fn log_proxied(
@@ -1179,6 +1555,7 @@ fn log_proxied(
             error_code = %error.code,
             error_type = %error.kind,
             error_message = %error.message,
+            error_body = %error.body,
             "proxied request"
         );
     } else {
@@ -2455,6 +2832,7 @@ mod tests {
                 ProviderAuth::new(auth).unwrap(),
             )])),
             proxy_token: Arc::new("test-gateway-token".into()),
+            codex_models: Arc::new(crate::codex_models::Catalog::default()),
         };
         let router = Router::new().fallback(inference).with_state(app.clone());
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -3516,23 +3894,23 @@ mod tests {
                 let bytes = axum::body::to_bytes(body, usize::MAX).await.unwrap();
                 tx.send((parts.headers.clone(), bytes.clone())).unwrap();
                 let value: Value = serde_json::from_slice(&bytes).unwrap_or(json!({}));
-                if value["model"] == "gpt-4o-mini" {
+                if value["model"] == "gpt-4o-mini" || value["model"] == "detail-shape" {
+                    let payload = if value["model"] == "detail-shape" {
+                        include_str!("../tests/fixtures/codex/error_detail.json").to_owned()
+                    } else {
+                        include_str!("../tests/fixtures/codex/error_message.json")
+                            .replace(
+                                "The 'gpt-5.5' model is not supported when using Codex with a ChatGPT account.",
+                                "model is not available",
+                            )
+                    };
                     return (
                         StatusCode::BAD_REQUEST,
                         [(
                             http::header::CONTENT_TYPE,
                             HeaderValue::from_static("application/json"),
                         )],
-                        json!({
-                            "error": {
-                                "message": "model is not available",
-                                "type": "invalid_request_error",
-                                "code": "model_not_found"
-                            },
-                            "input": "secret-prompt-do-not-log",
-                            "authorization": "dummy-access-token-do-not-log"
-                        })
-                        .to_string(),
+                        payload,
                     )
                         .into_response();
                 }
@@ -3594,6 +3972,7 @@ mod tests {
                 ProviderAuth::new(auth).unwrap(),
             )])),
             proxy_token: Arc::new("test-gateway-token".into()),
+            codex_models: Arc::new(crate::codex_models::Catalog::default()),
         };
         for model in ["gpt-5.1-codex", "gpt-4o-mini"] {
             let response = inference(
@@ -3622,8 +4001,18 @@ mod tests {
             assert!(upstream.get("max_output_tokens").is_none());
             assert!(upstream.get("temperature").is_none());
             assert!(upstream.get("instructions").is_none());
+            assert_eq!(upstream["input"][0]["type"], "message");
+            assert_eq!(upstream["tool_choice"], "auto");
             assert_eq!(headers["originator"], "codex_cli_rs");
             assert_eq!(headers["accept"], "text/event-stream");
+            assert!(headers.get("version").is_none());
+            assert!(headers.get("openai-beta").is_none());
+            assert_eq!(headers["session-id"], headers["thread-id"]);
+            assert!(
+                headers
+                    .get("x-openai-internal-codex-responses-lite")
+                    .is_none()
+            );
             assert!(
                 headers["authorization"]
                     .to_str()
@@ -3644,6 +4033,54 @@ mod tests {
                 assert_eq!(value["choices"][0]["message"]["content"], "pong");
             }
         }
+        let lite = inference(
+            State(app.clone()),
+            Request::builder()
+                .method(Method::POST)
+                .uri("/v1/chat/completions")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "model": "gpt-5.6-sol",
+                        "messages": [{"role": "user", "content": "secret-prompt-do-not-log"}],
+                        "max_tokens": 1
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await;
+        let (lite_headers, lite_bytes) = seen.recv().await.unwrap();
+        let lite_body: Value = serde_json::from_slice(&lite_bytes).unwrap();
+        assert_eq!(lite.status(), StatusCode::OK);
+        assert_eq!(lite_body["parallel_tool_calls"], false);
+        assert_eq!(lite_body["reasoning"]["effort"], "low");
+        assert_eq!(lite_body["reasoning"]["context"], "all_turns");
+        assert_eq!(lite_body["text"]["verbosity"], "low");
+        assert!(lite_body.get("tools").is_none(), "{lite_body}");
+        assert_eq!(
+            lite_headers["x-openai-internal-codex-responses-lite"],
+            "true"
+        );
+        let detail = inference(
+            State(app.clone()),
+            Request::builder()
+                .method(Method::POST)
+                .uri("/v1/chat/completions")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "model": "detail-shape",
+                        "messages": [{"role": "user", "content": "secret-prompt-do-not-log"}],
+                        "max_tokens": 1
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(detail.status(), StatusCode::BAD_REQUEST);
+        let _ = seen.recv().await.unwrap();
         let logged = events.lock().unwrap().clone();
         let rendered = format!("{logged:?}");
         assert!(!rendered.contains("secret-prompt-do-not-log"), "{rendered}");
@@ -3700,6 +4137,27 @@ mod tests {
             failure.get("error_message").map(String::as_str),
             Some("model is not available")
         );
+        assert_eq!(failure.get("error_body").map(String::as_str), Some(""));
+        let detail_log = logged
+            .iter()
+            .find(|event| {
+                event
+                    .get("model")
+                    .is_some_and(|model| model.contains("detail-shape"))
+            })
+            .unwrap_or_else(|| panic!("missing detail log in {logged:?}"));
+        let detail_message = detail_log.get("error_message").map(String::as_str).unwrap();
+        assert!(
+            detail_message.contains("Field required"),
+            "{detail_message}"
+        );
+        let detail_body = detail_log.get("error_body").unwrap();
+        assert!(detail_body.contains("Field required"), "{detail_body}");
+        assert!(
+            !detail_body.contains("secret-prompt-do-not-log"),
+            "{detail_body}"
+        );
+        assert!(!detail_message.contains("secret-prompt-do-not-log"));
     }
 
     type CapturedLogs = Arc<std::sync::Mutex<Vec<BTreeMap<String, String>>>>;
