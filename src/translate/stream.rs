@@ -200,6 +200,282 @@ pub(crate) fn collect_response_sse(bytes: &[u8], to: Protocol) -> Result<Value> 
     completed.context("SSE ended without a terminal Responses object")
 }
 
+/// OpenAI-style error carried by a Responses `error` or `response.failed` event.
+///
+/// Field names follow `ResponsesStreamEvent` and `parse_failed_response` in
+/// openai/codex `69231e119bfca0b14453515e97d99688ce1c47c9`
+/// `codex-rs/codex-api/src/sse/responses.rs` and `responses_error.rs`.
+/// A missing message uses that file's `"response.failed event received"` fallback.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct UpstreamStreamFailure {
+    pub code: String,
+    pub kind: String,
+    pub message: String,
+}
+
+#[derive(Debug)]
+pub(crate) enum ChatSseError {
+    Upstream(UpstreamStreamFailure),
+    Invalid(anyhow::Error),
+}
+
+impl ChatSseError {
+    fn invalid(error: impl Into<anyhow::Error>) -> Self {
+        Self::Invalid(error.into())
+    }
+}
+
+/// Assemble one Chat completion from a Responses SSE body.
+///
+/// Codex always sends `stream: true` (`ResponsesApiRequest`). The CLI parses
+/// that body as SSE regardless of media type (`spawn_response_stream` →
+/// `process_sse` in the file cited above). Assistant text is `output_text`
+/// deltas or the terminal message item. Reasoning items and the events the CLI
+/// only traces (`response.metadata`, `codex.response.metadata`,
+/// `response.reasoning_*`) are not chat content. `response.model` is used when
+/// the `openai-model` header, which the CLI prefers, is absent.
+pub(crate) fn chat_from_responses_sse(
+    bytes: &[u8],
+    fallback_model: &str,
+    header_model: Option<&str>,
+) -> Result<Value, ChatSseError> {
+    let mut parser = Sse::default();
+    let mut completed = None;
+    let mut deltas = String::new();
+    let mut reported = header_model
+        .map(str::trim)
+        .filter(|model| !model.is_empty())
+        .map(str::to_owned);
+    for &byte in bytes {
+        let Some(frame) = parser.byte(byte).map_err(ChatSseError::invalid)? else {
+            continue;
+        };
+        if frame.data == b"[DONE]" {
+            if completed.is_none() {
+                return Err(ChatSseError::invalid(anyhow::anyhow!(
+                    "Responses stream ended before a terminal response"
+                )));
+            }
+            continue;
+        }
+        let event = crate::json::from_slice(&frame.data)
+            .context("invalid Responses SSE JSON")
+            .map_err(ChatSseError::invalid)?;
+        let kind = event["type"].as_str().unwrap_or(frame.event.as_str());
+        if !frame.event.is_empty() && kind != frame.event {
+            return Err(ChatSseError::invalid(anyhow::anyhow!(
+                "Responses SSE event name disagrees with payload type"
+            )));
+        }
+        if reported.is_none()
+            && let Some(model) = event_reported_model(&event)
+        {
+            reported = Some(model);
+        }
+        if kind == "error"
+            || kind == "response.failed"
+            || (event.get("error").is_some_and(|value| !value.is_null())
+                && !matches!(kind, "response.completed" | "response.incomplete"))
+        {
+            if completed.is_some() {
+                return Err(ChatSseError::invalid(anyhow::anyhow!(
+                    "Responses stream emitted data after its terminal response"
+                )));
+            }
+            return Err(ChatSseError::Upstream(failure_from_event(&event)));
+        }
+        if kind == "response.output_text.delta"
+            && let Some(delta) = event.get("delta").and_then(Value::as_str)
+        {
+            deltas.push_str(delta);
+        }
+        if matches!(kind, "response.completed" | "response.incomplete") {
+            if completed.is_some() {
+                return Err(ChatSseError::invalid(anyhow::anyhow!(
+                    "Responses stream emitted data after its terminal response"
+                )));
+            }
+            let response = event
+                .get("response")
+                .filter(|value| value.is_object())
+                .context("terminal Responses event is missing its response object")
+                .map_err(ChatSseError::invalid)?;
+            if let Some(failure) = terminal_failure(response) {
+                return Err(ChatSseError::Upstream(failure));
+            }
+            validate_responses_terminal(response, kind).map_err(ChatSseError::invalid)?;
+            completed = Some(response.clone());
+        }
+    }
+    if parser.pending() {
+        return Err(ChatSseError::invalid(anyhow::anyhow!(
+            "truncated Responses SSE frame at EOF"
+        )));
+    }
+    let mut response = completed.ok_or_else(|| {
+        ChatSseError::invalid(anyhow::anyhow!(
+            "SSE ended without a terminal Responses object"
+        ))
+    })?;
+    if reported.is_none()
+        && let Some(model) = header_model_value(response.get("headers"))
+    {
+        reported = Some(model);
+    }
+    let created = unix_timestamp(&response["created_at"]).unwrap_or(0);
+    let model = reported
+        .or_else(|| {
+            response
+                .get("model")
+                .and_then(Value::as_str)
+                .filter(|model| !model.is_empty())
+                .map(str::to_owned)
+        })
+        .unwrap_or_else(|| fallback_model.to_owned());
+    prepare_chat_response(&mut response, &deltas);
+    let mut value = super::response(response, Protocol::Responses, Protocol::Chat, &model)
+        .map_err(ChatSseError::invalid)?;
+    value["created"] = json!(created);
+    value["model"] = json!(model);
+    Ok(value)
+}
+
+fn terminal_failure(response: &Value) -> Option<UpstreamStreamFailure> {
+    let error = response.get("error")?;
+    if error.is_null() {
+        return None;
+    }
+    Some(failure_from_error(error, "response.failed event received"))
+}
+
+fn failure_from_event(event: &Value) -> UpstreamStreamFailure {
+    let fallback = if event["type"] == "response.failed" {
+        "response.failed event received"
+    } else {
+        "upstream stream failed"
+    };
+    let error = event
+        .get("error")
+        .filter(|value| !value.is_null())
+        .or_else(|| event.pointer("/response/error"))
+        .cloned()
+        .unwrap_or(Value::Null);
+    failure_from_error(&error, fallback)
+}
+
+fn failure_from_error(error: &Value, fallback: &str) -> UpstreamStreamFailure {
+    let message = error
+        .get("message")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|message| !message.is_empty())
+        .unwrap_or(fallback)
+        .to_owned();
+    let code = match error.get("code") {
+        Some(Value::String(value)) => value.clone(),
+        Some(Value::Number(value)) => value.to_string(),
+        _ => String::new(),
+    };
+    let kind = error
+        .get("type")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_owned();
+    UpstreamStreamFailure {
+        code,
+        kind,
+        message,
+    }
+}
+
+pub(crate) fn openai_error_object(error: &Value, fallback: &str) -> Value {
+    let failure = failure_from_error(error, fallback);
+    let kind = if failure.kind.is_empty() {
+        "api_error".to_owned()
+    } else {
+        failure.kind
+    };
+    let code = if failure.code.is_empty() {
+        Value::Null
+    } else {
+        Value::String(failure.code)
+    };
+    json!({
+        "message": failure.message,
+        "type": kind,
+        "param": Value::Null,
+        "code": code
+    })
+}
+
+fn event_reported_model(event: &Value) -> Option<String> {
+    header_model_value(event.get("headers"))
+        .or_else(|| header_model_value(event.pointer("/response/headers")))
+}
+
+fn header_model_value(headers: Option<&Value>) -> Option<String> {
+    let headers = headers?.as_object()?;
+    headers.iter().find_map(|(name, value)| {
+        if name.eq_ignore_ascii_case("openai-model") || name.eq_ignore_ascii_case("x-openai-model")
+        {
+            match value {
+                Value::String(model) if !model.is_empty() => Some(model.clone()),
+                Value::Array(items) => items.iter().find_map(|item| {
+                    item.as_str()
+                        .filter(|model| !model.is_empty())
+                        .map(str::to_owned)
+                }),
+                _ => None,
+            }
+        } else {
+            None
+        }
+    })
+}
+
+fn unix_timestamp(value: &Value) -> Option<i64> {
+    value
+        .as_i64()
+        .or_else(|| value.as_u64().and_then(|value| i64::try_from(value).ok()))
+}
+
+fn prepare_chat_response(response: &mut Value, deltas: &str) {
+    let Some(object) = response.as_object_mut() else {
+        return;
+    };
+    let output = object.entry("output").or_insert_with(|| json!([]));
+    if !output.is_array() {
+        *output = json!([]);
+    }
+    if let Some(items) = output.as_array_mut() {
+        items.retain(|item| item.get("type").and_then(Value::as_str) != Some("reasoning"));
+        for item in items {
+            if item.get("type").and_then(Value::as_str) == Some("message")
+                && let Some(message) = item.as_object_mut()
+            {
+                message.remove("phase");
+            }
+        }
+    }
+    let has_text = response["output"].as_array().is_some_and(|items| {
+        items.iter().any(|item| {
+            item["type"] == "message"
+                && item["content"].as_array().is_some_and(|parts| {
+                    parts
+                        .iter()
+                        .any(|part| part.get("type").and_then(Value::as_str) == Some("output_text"))
+                })
+        })
+    });
+    if !has_text && !deltas.is_empty() {
+        response["output"].as_array_mut().unwrap().push(json!({
+            "type": "message",
+            "role": "assistant",
+            "content": [{"type": "output_text", "text": deltas, "annotations": []}]
+        }));
+    }
+}
+
 #[derive(Debug)]
 struct Block {
     index: usize,
@@ -253,6 +529,11 @@ pub struct StreamTranslator {
     source_finished: bool,
     finish_reason: Option<String>,
     include_usage: bool,
+    created: i64,
+    /// Codex Responses streams include reasoning, phase, and metadata events the
+    /// CLI accepts. Chat translation keeps output_text and drops the rest.
+    lenient: bool,
+    model_locked: bool,
     usage: Usage,
 }
 impl StreamTranslator {
@@ -284,7 +565,54 @@ impl StreamTranslator {
             source_finished: false,
             finish_reason: None,
             include_usage,
+            created: 0,
+            lenient: false,
+            model_locked: false,
             usage: Usage::default(),
+        }
+    }
+
+    /// Accept the Responses events the Codex CLI traces or treats as reasoning
+    /// rather than assistant text. See `process_responses_event` at
+    /// openai/codex `69231e119bfca0b14453515e97d99688ce1c47c9`.
+    pub fn lenient(mut self) -> Self {
+        self.lenient = true;
+        self
+    }
+
+    /// `openai-model` response header. The CLI reports this ahead of `response.model`.
+    pub fn set_reported_model(&mut self, model: String) {
+        let model = model.trim();
+        if !model.is_empty() {
+            self.model = model.to_owned();
+            self.model_locked = true;
+        }
+    }
+
+    fn note_model(&mut self, model: String, lock: bool) {
+        if self.model_locked || model.is_empty() {
+            return;
+        }
+        self.model = model;
+        self.model_locked = lock;
+    }
+
+    fn note_response(&mut self, response: &Value) {
+        if !response.is_object() {
+            return;
+        }
+        if let Some(model) = header_model_value(response.get("headers")) {
+            self.note_model(model, true);
+        }
+        if let Some(model) = response
+            .get("model")
+            .and_then(Value::as_str)
+            .filter(|model| !model.is_empty())
+        {
+            self.note_model(model.to_owned(), false);
+        }
+        if let Some(created) = unix_timestamp(&response["created_at"]) {
+            self.created = created;
         }
     }
     /// Distinguishes a cleanly framed provider error from a successful generation.
@@ -392,7 +720,17 @@ impl StreamTranslator {
                     json!({"type":"error","error":{"type":"api_error","message":error.get("message").and_then(Value::as_str).unwrap_or("upstream stream failed"),"upstream_error":error}}),
                 );
             } else {
-                emit(output, None, json!({"error":error}));
+                let fallback =
+                    if value["type"] == "response.failed" || frame.event == "response.failed" {
+                        "response.failed event received"
+                    } else {
+                        "upstream stream failed"
+                    };
+                emit(
+                    output,
+                    None,
+                    json!({"error": openai_error_object(&error, fallback)}),
+                );
                 output.push(Bytes::from_static(b"data: [DONE]\n\n"));
             }
             self.terminal = true;
@@ -431,7 +769,7 @@ impl StreamTranslator {
         emit(
             output,
             None,
-            json!({"id":self.id,"object":"chat.completion.chunk","created":0,"model":self.model,"choices":[{"index":0,"delta":delta,"finish_reason":finish,"logprobs":null}]}),
+            json!({"id":self.id,"object":"chat.completion.chunk","created":self.created,"model":self.model,"choices":[{"index":0,"delta":delta,"finish_reason":finish,"logprobs":null}]}),
         );
     }
     fn new_block(&mut self, key: &str, text: bool) -> Result<()> {
@@ -961,7 +1299,7 @@ impl StreamTranslator {
                 emit(
                     output,
                     None,
-                    json!({"id":self.id,"object":"chat.completion.chunk","created":0,"model":self.model,"choices":[],"usage":self.usage.json(self.to)}),
+                    json!({"id":self.id,"object":"chat.completion.chunk","created":self.created,"model":self.model,"choices":[],"usage":self.usage.json(self.to)}),
                 );
             }
             output.push(Bytes::from_static(b"data: [DONE]\n\n"));
@@ -1047,7 +1385,9 @@ impl StreamTranslator {
                 Ok(1)
             }
             Some("message") => {
-                super::validate_phase(item)?;
+                if !self.lenient {
+                    super::validate_phase(item)?;
+                }
                 if item["role"] != "assistant" {
                     bail!("Responses output message must have assistant role");
                 }
@@ -1073,7 +1413,9 @@ impl StreamTranslator {
                 Ok(parts.len())
             }
             Some("reasoning") => {
-                validate_reasoning(item)?;
+                if !self.lenient {
+                    validate_reasoning(item)?;
+                }
                 Ok(0)
             }
             _ => bail!(
@@ -1087,18 +1429,20 @@ impl StreamTranslator {
         if !event.is_empty() && kind != event {
             bail!("Responses SSE event name disagrees with payload type");
         }
-        if (kind.starts_with("response.output_item.")
-            || kind.starts_with("response.content_part.")
-            || kind.starts_with("response.output_text.")
-            || kind.starts_with("response.refusal.")
-            || kind.starts_with("response.function_call_arguments."))
+        if !self.lenient
+            && (kind.starts_with("response.output_item.")
+                || kind.starts_with("response.content_part.")
+                || kind.starts_with("response.output_text.")
+                || kind.starts_with("response.refusal.")
+                || kind.starts_with("response.function_call_arguments."))
             && v["output_index"].as_u64().is_none()
         {
             bail!("Responses content/tool event is missing a nonnegative output_index");
         }
-        if (kind.starts_with("response.content_part.")
-            || kind.starts_with("response.output_text.")
-            || kind.starts_with("response.refusal."))
+        if !self.lenient
+            && (kind.starts_with("response.content_part.")
+                || kind.starts_with("response.output_text.")
+                || kind.starts_with("response.refusal."))
             && v["content_index"].as_u64().is_none()
         {
             bail!("Responses text event is missing a nonnegative content_index");
@@ -1126,6 +1470,7 @@ impl StreamTranslator {
                     bail!("duplicate response.created");
                 }
                 self.source_started = true;
+                self.note_response(&v["response"]);
                 if let Some(id) = v.pointer("/response/id").and_then(Value::as_str) {
                     self.id = id.into();
                 }
@@ -1149,8 +1494,16 @@ impl StreamTranslator {
                         self.tool_delta(&tool_key, args, output)?;
                     }
                 }
-                Some("message") => super::validate_phase(&v["item"])?,
-                Some("reasoning") => validate_reasoning(&v["item"])?,
+                Some("message") => {
+                    if !self.lenient {
+                        super::validate_phase(&v["item"])?;
+                    }
+                }
+                Some("reasoning") => {
+                    if !self.lenient {
+                        validate_reasoning(&v["item"])?;
+                    }
+                }
                 _ => bail!(
                     "unsupported Responses streamed output item {}; use native Responses for server tools",
                     v["item"]["type"]
@@ -1252,6 +1605,7 @@ impl StreamTranslator {
             }
             "response.completed" | "response.incomplete" => {
                 let response = &v["response"];
+                self.note_response(response);
                 validate_responses_terminal(response, kind)?;
                 self.usage = Usage::parse(&response["usage"], Protocol::Responses)?;
                 let mut count = 0;
@@ -1282,12 +1636,29 @@ impl StreamTranslator {
                 }
             }
             "response.output_text.annotation.added" => {
-                bail!("Responses annotations cannot be translated losslessly; use native Responses")
+                if !self.lenient {
+                    bail!(
+                        "Responses annotations cannot be translated losslessly; use native Responses"
+                    );
+                }
             }
-            k if k.starts_with("response.reasoning") => bail!(
-                "Responses reasoning summaries cannot be represented losslessly; disable summaries or use native Responses"
-            ),
-            _ => bail!("unsupported Responses SSE event {kind}; use native Responses"),
+            k if k.starts_with("response.reasoning") => {
+                if !self.lenient {
+                    bail!(
+                        "Responses reasoning summaries cannot be represented losslessly; disable summaries or use native Responses"
+                    );
+                }
+            }
+            "response.metadata" | "codex.response.metadata" | "responsesapi.websocket_timing" => {
+                if !self.lenient {
+                    bail!("unsupported Responses SSE event {kind}; use native Responses");
+                }
+            }
+            _ => {
+                if !self.lenient {
+                    bail!("unsupported Responses SSE event {kind}; use native Responses");
+                }
+            }
         }
         Ok(())
     }
@@ -3784,5 +4155,138 @@ mod tests {
             .unwrap();
         t.push(b"data: [DONE]").unwrap();
         assert!(t.finish().is_err());
+    }
+
+    fn codex_fixture(name: &str) -> &'static [u8] {
+        match name {
+            "success" => include_bytes!("../../tests/fixtures/codex/responses_sse_success.txt"),
+            "failed" => include_bytes!("../../tests/fixtures/codex/responses_sse_failed.txt"),
+            "reasoning" => {
+                include_bytes!("../../tests/fixtures/codex/responses_sse_reasoning_only.txt")
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    #[test]
+    fn codex_sse_fixtures_assemble_chat_completions() {
+        let success = chat_from_responses_sse(codex_fixture("success"), "client-model", None)
+            .expect("success fixture");
+        assert_eq!(success["id"], "resp_ok");
+        assert_eq!(success["object"], "chat.completion");
+        assert_eq!(success["created"], 1763040000);
+        assert_eq!(success["model"], "gpt-6.1-sol");
+        assert_eq!(success["choices"][0]["message"]["role"], "assistant");
+        assert_eq!(success["choices"][0]["message"]["content"], "pong");
+        assert_eq!(success["choices"][0]["finish_reason"], "stop");
+        assert_eq!(success["usage"]["prompt_tokens"], 5);
+        assert_eq!(success["usage"]["completion_tokens"], 2);
+        assert_eq!(
+            success["usage"]["completion_tokens_details"]["reasoning_tokens"],
+            1
+        );
+        assert!(!success.to_string().contains("opaque-reasoning"));
+        assert!(!success.to_string().contains("hidden thought"));
+        assert!(!success.to_string().contains("final_answer"));
+
+        let header = chat_from_responses_sse(codex_fixture("success"), "client-model", Some("hdr"))
+            .expect("header model");
+        assert_eq!(header["model"], "hdr");
+
+        let failure = chat_from_responses_sse(codex_fixture("failed"), "client-model", None);
+        match failure {
+            Err(ChatSseError::Upstream(failure)) => {
+                assert_eq!(failure.code, "context_length_exceeded");
+                assert_eq!(failure.kind, "invalid_request_error");
+                assert_eq!(
+                    failure.message,
+                    "Your input exceeds the context window of this model. Please adjust your input and try again."
+                );
+            }
+            other => panic!("expected upstream failure, got {other:?}"),
+        }
+
+        let reasoning = chat_from_responses_sse(codex_fixture("reasoning"), "client-model", None)
+            .expect("reasoning-only");
+        assert_eq!(reasoning["id"], "resp_len");
+        assert_eq!(reasoning["created"], 1763040001);
+        assert_eq!(reasoning["model"], "gpt-6.1-sol");
+        assert_eq!(reasoning["choices"][0]["message"]["content"], "");
+        assert_eq!(reasoning["choices"][0]["finish_reason"], "length");
+        assert_eq!(reasoning["usage"]["prompt_tokens"], 4);
+        assert_eq!(reasoning["usage"]["completion_tokens"], 3);
+        assert_eq!(
+            reasoning["usage"]["prompt_tokens_details"]["cached_tokens"],
+            1
+        );
+        assert_eq!(
+            reasoning["usage"]["completion_tokens_details"]["reasoning_tokens"],
+            3
+        );
+        assert!(!reasoning.to_string().contains("hidden thought"));
+    }
+
+    #[test]
+    fn codex_sse_fixtures_translate_to_chat_chunks_when_lenient() {
+        let success = translate_lenient(codex_fixture("success"));
+        assert!(success.contains("\"model\":\"gpt-6.1-sol\""));
+        assert!(success.contains("\"created\":1763040000"));
+        assert!(success.contains("\"content\":\"po\""));
+        assert!(success.contains("\"content\":\"ng\""));
+        assert!(success.contains("\"finish_reason\":\"stop\""));
+        assert!(success.ends_with("data: [DONE]\n\n"));
+        assert!(!success.contains("hidden thought"));
+        assert!(!success.contains("opaque-reasoning"));
+        assert!(!success.contains("summary"));
+
+        let reasoning = translate_lenient(codex_fixture("reasoning"));
+        assert!(reasoning.contains("\"finish_reason\":\"length\""));
+        assert!(reasoning.ends_with("data: [DONE]\n\n"));
+        assert!(!reasoning.contains("hidden thought"));
+        assert!(!reasoning.contains("\"content\":\"summary\""));
+
+        let failed = translate_lenient(codex_fixture("failed"));
+        assert!(failed.contains("\"code\":\"context_length_exceeded\""));
+        assert!(failed.contains("\"type\":\"invalid_request_error\""));
+        assert!(failed.contains(
+            "Your input exceeds the context window of this model. Please adjust your input and try again."
+        ));
+        assert!(failed.ends_with("data: [DONE]\n\n"));
+
+        let mut strict =
+            StreamTranslator::new(Protocol::Responses, Protocol::Chat, "x".into(), false);
+        let error = strict.push(codex_fixture("success")).unwrap_err();
+        assert!(
+            error.to_string().contains("reasoning") || error.to_string().contains("encrypted"),
+            "{error}"
+        );
+    }
+
+    fn translate_lenient(bytes: &[u8]) -> String {
+        let mut translator = StreamTranslator::new(
+            Protocol::Responses,
+            Protocol::Chat,
+            "client-model".into(),
+            true,
+        )
+        .lenient();
+        let mut output = joined(translator.push(bytes).unwrap());
+        output.push_str(&joined(translator.finish().unwrap()));
+        output
+    }
+
+    #[test]
+    fn chat_assembly_uses_output_text_deltas_when_the_terminal_item_has_no_text() {
+        let bytes = b"\
+event: response.output_text.delta\n\
+data: {\"type\":\"response.output_text.delta\",\"delta\":\"from-delta\"}\n\
+\n\
+event: response.completed\n\
+data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_delta\",\"created_at\":10,\"status\":\"completed\",\"error\":null,\"output\":[],\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n\
+\n";
+        let value = chat_from_responses_sse(bytes, "fallback", None).unwrap();
+        assert_eq!(value["choices"][0]["message"]["content"], "from-delta");
+        assert_eq!(value["model"], "fallback");
+        assert_eq!(value["created"], 10);
     }
 }

@@ -3195,3 +3195,232 @@ async fn codex_models_discovery_failure_falls_back_to_the_static_list() -> Resul
     assert_eq!(captured.path, "/backend-api/codex/models");
     Ok(())
 }
+
+fn codex_sse_reply(
+    name: &str,
+    content_type: Option<&'static str>,
+    headers: Vec<(&'static str, &'static str)>,
+) -> Reply {
+    let bytes: &'static [u8] = match name {
+        "success" => include_bytes!("fixtures/codex/responses_sse_success.txt"),
+        "failed" => include_bytes!("fixtures/codex/responses_sse_failed.txt"),
+        "reasoning" => include_bytes!("fixtures/codex/responses_sse_reasoning_only.txt"),
+        _ => unreachable!(),
+    };
+    Reply {
+        status: StatusCode::OK,
+        content_type,
+        chunks: vec![bytes.to_vec()],
+        headers,
+        gates: None,
+    }
+}
+
+fn codex_chat(stream: bool) -> Value {
+    let mut body = json!({
+        "model": "gpt-6.1-sol",
+        "messages": [{"role": "user", "content": "ping"}],
+        "max_tokens": 1
+    });
+    if stream {
+        body["stream"] = json!(true);
+    }
+    body
+}
+
+#[tokio::test]
+async fn codex_chat_completion_assembles_responses_sse_without_a_sse_media_type() -> Result<()> {
+    let auth_root = tempfile::tempdir()?;
+    let auth = valid_codex_auth(auth_root.path())?;
+    let replies = vec![
+        codex_sse_reply("success", None, vec![]),
+        codex_sse_reply("success", Some("application/json"), vec![]),
+        codex_sse_reply("success", Some("text/event-stream"), vec![]),
+        codex_sse_reply(
+            "success",
+            Some("application/json"),
+            vec![("openai-model", "header-model")],
+        ),
+        codex_sse_reply("success", Some("application/json"), vec![]),
+        codex_sse_reply("failed", Some("application/json"), vec![]),
+        codex_sse_reply("failed", Some("text/event-stream"), vec![]),
+        codex_sse_reply("reasoning", Some("application/json"), vec![]),
+        codex_sse_reply("reasoning", Some("application/json"), vec![]),
+    ];
+    let mut fixture = Fixture::start(replies).await?;
+    let gateway = Gateway::start("codex", &fixture.base, "unused-alias", Some(&auth)).await?;
+
+    for content_type in ["missing", "application/json", "text/event-stream"] {
+        let response = gateway
+            .post("/v1/chat/completions", &codex_chat(false))
+            .await?;
+        let id = trace_id(&response)?;
+        assert_eq!(response.status(), StatusCode::OK, "{content_type}");
+        assert_eq!(
+            response.headers()["content-type"],
+            "application/json",
+            "{content_type}"
+        );
+        let body: Value = response.json().await?;
+        assert_eq!(body["id"], "resp_ok", "{content_type}");
+        assert_eq!(body["object"], "chat.completion", "{content_type}");
+        assert_eq!(body["created"], 1763040000, "{content_type}");
+        assert_eq!(body["model"], "gpt-6.1-sol", "{content_type}");
+        assert_eq!(
+            body["choices"][0]["message"]["content"], "pong",
+            "{content_type}"
+        );
+        assert_eq!(
+            body["choices"][0]["finish_reason"], "stop",
+            "{content_type}"
+        );
+        assert_eq!(body["usage"]["prompt_tokens"], 5, "{content_type}");
+        assert_eq!(body["usage"]["completion_tokens"], 2, "{content_type}");
+        assert_eq!(
+            body["usage"]["completion_tokens_details"]["reasoning_tokens"], 1,
+            "{content_type}"
+        );
+        assert!(
+            !body.to_string().contains("opaque-reasoning"),
+            "{content_type}"
+        );
+        let trace = completed_trace(&gateway, &id).await?;
+        assert_eq!(trace["status"], 200, "{content_type}");
+        assert_eq!(trace["error"], Value::Null, "{content_type}");
+        let received = fixture.received().await?;
+        assert_eq!(received.path, "/backend-api/codex/responses");
+        let upstream: Value = serde_json::from_slice(&received.body)?;
+        assert_eq!(upstream["stream"], true);
+        assert_eq!(upstream["model"], "gpt-6.1-sol");
+    }
+
+    let header = gateway
+        .post("/v1/chat/completions", &codex_chat(false))
+        .await?;
+    assert_eq!(header.status(), StatusCode::OK);
+    let header: Value = header.json().await?;
+    assert_eq!(header["model"], "header-model");
+    assert_eq!(header["choices"][0]["message"]["content"], "pong");
+    let _ = fixture.received().await?;
+
+    let streamed = gateway
+        .post("/v1/chat/completions", &codex_chat(true))
+        .await?;
+    let streamed_id = trace_id(&streamed)?;
+    assert_eq!(streamed.status(), StatusCode::OK);
+    assert_eq!(streamed.headers()["content-type"], "text/event-stream");
+    let bytes = streamed.bytes().await?;
+    let events = sse_events(&bytes)?;
+    let text: String = events
+        .iter()
+        .filter(|event| event.data != "[DONE]")
+        .map(|event| serde_json::from_str::<Value>(&event.data).unwrap())
+        .filter_map(|event| {
+            event["choices"][0]["delta"]["content"]
+                .as_str()
+                .map(str::to_owned)
+        })
+        .collect();
+    assert_eq!(text, "pong");
+    assert!(events.iter().any(|event| event.data == "[DONE]"));
+    assert!(events.iter().any(|event| {
+        serde_json::from_str::<Value>(&event.data)
+            .ok()
+            .is_some_and(|value| value["choices"][0]["finish_reason"] == "stop")
+    }));
+    assert!(events.iter().any(|event| {
+        serde_json::from_str::<Value>(&event.data)
+            .ok()
+            .is_some_and(|value| value["model"] == "gpt-6.1-sol" && value["created"] == 1763040000)
+    }));
+    assert!(!String::from_utf8_lossy(&bytes).contains("hidden thought"));
+    assert_eq!(
+        completed_trace(&gateway, &streamed_id).await?["error"],
+        Value::Null
+    );
+    let _ = fixture.received().await?;
+
+    let failed = gateway
+        .post("/v1/chat/completions", &codex_chat(false))
+        .await?;
+    let failed_id = trace_id(&failed)?;
+    assert_eq!(failed.status(), StatusCode::BAD_REQUEST);
+    let failed_body: Value = failed.json().await?;
+    assert_eq!(failed_body["error"]["code"], "context_length_exceeded");
+    assert_eq!(failed_body["error"]["type"], "invalid_request_error");
+    assert_eq!(
+        failed_body["error"]["message"],
+        "Your input exceeds the context window of this model. Please adjust your input and try again."
+    );
+    let failed_trace = completed_trace(&gateway, &failed_id).await?;
+    assert_eq!(failed_trace["status"], 400);
+    assert!(
+        failed_trace["error"]
+            .as_str()
+            .unwrap()
+            .contains("context window")
+    );
+    let _ = fixture.received().await?;
+
+    let failed_stream = gateway
+        .post("/v1/chat/completions", &codex_chat(true))
+        .await?;
+    let failed_stream_id = trace_id(&failed_stream)?;
+    assert_eq!(failed_stream.status(), StatusCode::OK);
+    let failed_bytes = failed_stream.bytes().await?;
+    let failed_events = sse_events(&failed_bytes)?;
+    assert!(failed_events.iter().any(|event| event.data == "[DONE]"));
+    let error = failed_events
+        .iter()
+        .filter_map(|event| serde_json::from_str::<Value>(&event.data).ok())
+        .find(|event| event.get("error").is_some())
+        .context("missing streamed error")?;
+    assert_eq!(error["error"]["code"], "context_length_exceeded");
+    assert_eq!(error["error"]["type"], "invalid_request_error");
+    assert!(
+        error["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("context window")
+    );
+    assert!(completed_trace(&gateway, &failed_stream_id).await?["error"].is_string());
+    let _ = fixture.received().await?;
+
+    let reasoning = gateway
+        .post("/v1/chat/completions", &codex_chat(false))
+        .await?;
+    assert_eq!(reasoning.status(), StatusCode::OK);
+    let reasoning: Value = reasoning.json().await?;
+    assert_eq!(reasoning["id"], "resp_len");
+    assert_eq!(reasoning["created"], 1763040001);
+    assert_eq!(reasoning["model"], "gpt-6.1-sol");
+    assert_eq!(reasoning["choices"][0]["message"]["content"], "");
+    assert_eq!(reasoning["choices"][0]["finish_reason"], "length");
+    assert_eq!(reasoning["usage"]["prompt_tokens"], 4);
+    assert_eq!(reasoning["usage"]["completion_tokens"], 3);
+    assert_eq!(
+        reasoning["usage"]["prompt_tokens_details"]["cached_tokens"],
+        1
+    );
+    assert_eq!(
+        reasoning["usage"]["completion_tokens_details"]["reasoning_tokens"],
+        3
+    );
+    assert!(!reasoning.to_string().contains("hidden thought"));
+    let _ = fixture.received().await?;
+
+    let reasoning_stream = gateway
+        .post("/v1/chat/completions", &codex_chat(true))
+        .await?;
+    assert_eq!(reasoning_stream.status(), StatusCode::OK);
+    let reasoning_bytes = reasoning_stream.bytes().await?;
+    let reasoning_text = String::from_utf8_lossy(&reasoning_bytes);
+    assert!(reasoning_text.contains("\"finish_reason\":\"length\""));
+    assert!(
+        reasoning_text.ends_with("data: [DONE]\n\n") || reasoning_text.contains("data: [DONE]\n\n")
+    );
+    assert!(!reasoning_text.contains("hidden thought"));
+    assert!(!reasoning_text.contains("opaque-reasoning"));
+    let _ = fixture.received().await?;
+    Ok(())
+}

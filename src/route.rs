@@ -27,6 +27,9 @@ pub struct ResponsePlan {
     pub client_stream: bool,
     pub include_usage: bool,
     pub upstream_stream: bool,
+    /// The backend always receives a Responses stream, so the body is SSE even
+    /// when its media type is not `text/event-stream`.
+    pub forced_sse: bool,
 }
 pub struct RoutePolicy<'a> {
     pub access_program: Option<&'a str>,
@@ -822,6 +825,7 @@ fn prepare_generation(
                 .get("stream")
                 .and_then(Value::as_bool)
                 .unwrap_or(false),
+            forced_sse: generation.expects_sse(),
         }),
         decision: None,
     })
