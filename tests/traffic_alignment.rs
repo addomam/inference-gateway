@@ -15,6 +15,7 @@ use axum::{
     response::Response,
 };
 use infer::traffic::codex::{self, CODEX};
+use infer::traffic::grok_build::{self, GROK_BUILD};
 use infer::traffic::{self, ActualRequest, Harness, assert_clean};
 use serde_json::{Map, Value, json};
 use support::Gateway;
@@ -320,6 +321,255 @@ fn message_output_text(value: &Value) -> Option<String> {
                 last = Some(text.to_owned());
             }
         }
+    }
+    last
+}
+
+#[tokio::test]
+async fn grok_provider_forwards_a_chat_completion() -> Result<()> {
+    let body = json!({
+        "model": "grok-4",
+        "messages": [{"role": "user", "content": "Hello"}]
+    });
+    let reply = json!({
+        "id": "chatcmpl-fixture",
+        "choices": [{"message": {"role": "assistant", "content": "Hi"}}]
+    });
+    let mock = Mock::start(vec![Reply {
+        status: 200,
+        headers: json!({"content-type": "application/json"})
+            .as_object()
+            .cloned()
+            .context("content-type header")?,
+        body: serde_json::to_vec(&reply)?,
+    }])
+    .await?;
+    let gateway = Gateway::start("grok", &mock.base, "grok-4", None).await?;
+    let response = gateway
+        .client
+        .post(format!("{}/v1/chat/completions", gateway.base))
+        .header("x-infer-key", &gateway.proxy_token)
+        .json(&body)
+        .send()
+        .await
+        .context("send grok chat completion")?;
+    let status = response.status();
+    let text = response
+        .text()
+        .await
+        .context("read grok gateway response")?;
+    if !status.is_success() {
+        bail!("grok gateway returned {status}: {text}");
+    }
+    if !text.contains("Hi") {
+        bail!("grok gateway response did not contain the mock text: {text}");
+    }
+    let actual = mock.captured();
+    if actual.len() != 1 {
+        let paths: Vec<_> = actual.iter().map(|call| call.path.clone()).collect();
+        bail!(
+            "grok provider made {} upstream call(s) {paths:?}",
+            actual.len()
+        );
+    }
+    if actual[0].method != "POST" || actual[0].path != "/v1/chat/completions" {
+        bail!("grok provider sent {} {}", actual[0].method, actual[0].path);
+    }
+    let sent: Value = serde_json::from_slice(&actual[0].body).context("upstream body")?;
+    if sent["model"] != "grok-4" || sent["messages"][0]["content"] != "Hello" {
+        bail!("grok provider rewrote the chat body: {sent}");
+    }
+    let _ = gateway;
+    Ok(())
+}
+
+#[tokio::test]
+async fn grok_build_upstream_matches_the_cli_fixture() -> Result<()> {
+    let dir = grok_build::fixture_dir();
+    if !dir.is_dir() {
+        println!(
+            "skipping grok-build traffic alignment: {} does not exist. Record with `cargo run --bin traffic-record -- record --harness grok-build --scenario chat-turn --model <model> --prompt '...'`.",
+            dir.display()
+        );
+        return Ok(());
+    }
+    let fixtures = traffic::fixtures_in(&dir)?;
+    if fixtures.is_empty() {
+        println!(
+            "skipping grok-build traffic alignment: {} has no JSON fixtures. Record with `cargo run --bin traffic-record -- record --harness grok-build --scenario chat-turn --model <model> --prompt '...'`, review fixture.json, and copy it here. No Recorded capture is committed yet.",
+            dir.display()
+        );
+        return Ok(());
+    }
+    assert_clean(&dir)?;
+    for (path, fixture) in fixtures {
+        if fixture.harness != GROK_BUILD.id() {
+            bail!("{} is not a grok-build fixture", path.display());
+        }
+        if fixture.provenance == traffic::Provenance::SourceDerived {
+            let note = fixture.source.note.to_ascii_lowercase();
+            if !note.contains("not a packet capture") && !note.contains("source-derived") {
+                bail!("{} must say it is source-derived", path.display());
+            }
+        }
+        let replies = fixture
+            .exchanges
+            .iter()
+            .filter(|exchange| exchange.compare)
+            .map(|exchange| {
+                Ok(Reply {
+                    status: exchange.response.status,
+                    headers: exchange.response.headers.clone(),
+                    body: exchange.response.bytes()?,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let expected: Vec<_> = fixture
+            .exchanges
+            .iter()
+            .filter(|exchange| exchange.compare)
+            .map(|exchange| &exchange.request)
+            .collect();
+        let mock = Mock::start(replies).await?;
+        let gateway = Gateway::start("grok", &mock.base, "grok-4", None).await?;
+        let mut request = gateway
+            .client
+            .post(format!("{}{}", gateway.base, fixture.client.path));
+        request = request.header("x-infer-key", &gateway.proxy_token);
+        for (name, value) in &fixture.client.headers {
+            let Some(text) = value.as_str() else {
+                bail!("{} client header {name} is not a string", fixture.scenario);
+            };
+            request = request.header(name, text);
+        }
+        let response = request
+            .json(&fixture.client.body)
+            .send()
+            .await
+            .with_context(|| format!("send {}", fixture.scenario))?;
+        let status = response.status();
+        let content_type = response
+            .headers()
+            .get("content-type")
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or("")
+            .to_owned();
+        let bytes = response.bytes().await.context("read gateway response")?;
+        let text = String::from_utf8_lossy(&bytes);
+        if !status.is_success() {
+            bail!("{} gateway returned {status}: {text}", fixture.scenario);
+        }
+        let streamed = fixture.client.body.get("stream") == Some(&json!(true));
+        if streamed {
+            if !content_type
+                .to_ascii_lowercase()
+                .contains("text/event-stream")
+            {
+                bail!(
+                    "{} streamed response content-type is {content_type}",
+                    fixture.scenario
+                );
+            }
+        } else if !content_type
+            .to_ascii_lowercase()
+            .contains("application/json")
+        {
+            bail!(
+                "{} buffered response content-type is {content_type}",
+                fixture.scenario
+            );
+        }
+        let expected_text = replayed_output_text(&fixture)
+            .ok()
+            .or_else(|| chat_visible_text(&fixture).ok().flatten());
+        let Some(expected_text) = expected_text.filter(|text| !text.is_empty()) else {
+            bail!(
+                "{} compared exchange has no output_text or chat message to observe",
+                fixture.scenario
+            );
+        };
+        if !text.contains(&expected_text) {
+            bail!(
+                "{} client response did not contain the replayed text {expected_text:?}: {text}",
+                fixture.scenario
+            );
+        }
+        let actual = mock.captured();
+        if actual.len() != expected.len() {
+            let paths: Vec<_> = actual.iter().map(|call| call.path.clone()).collect();
+            bail!(
+                "{} made {} upstream call(s) {paths:?}, fixture expects {}",
+                fixture.scenario,
+                actual.len(),
+                expected.len()
+            );
+        }
+        for (index, (expected, actual)) in expected.iter().zip(actual.iter()).enumerate() {
+            traffic::align(&GROK_BUILD, expected, actual).with_context(|| {
+                format!(
+                    "{} exchange {index} drifted from the grok-build fixture",
+                    fixture.scenario
+                )
+            })?;
+        }
+        let _ = gateway;
+    }
+    Ok(())
+}
+
+fn chat_visible_text(fixture: &traffic::Fixture) -> Result<Option<String>> {
+    let mut text = None;
+    for exchange in fixture.exchanges.iter().filter(|exchange| exchange.compare) {
+        let bytes = exchange.response.bytes()?;
+        if let Some(found) = chat_text_from_replay(&bytes)
+            && !found.is_empty()
+        {
+            text = Some(found);
+        }
+    }
+    Ok(text)
+}
+
+fn chat_text_from_replay(bytes: &[u8]) -> Option<String> {
+    if let Ok(events) = support::sse_events(bytes) {
+        let mut deltas = String::new();
+        let mut message = None;
+        for event in events {
+            let Ok(value) = serde_json::from_str::<Value>(&event.data) else {
+                continue;
+            };
+            if let Some(text) = chat_choice_text(&value, "message") {
+                message = Some(text);
+            }
+            if let Some(text) = chat_choice_text(&value, "delta") {
+                deltas.push_str(&text);
+            }
+        }
+        if let Some(text) = message.filter(|text| !text.is_empty()) {
+            return Some(text);
+        }
+        if !deltas.is_empty() {
+            return Some(deltas);
+        }
+    }
+    serde_json::from_slice::<Value>(bytes)
+        .ok()
+        .as_ref()
+        .and_then(|value| chat_choice_text(value, "message"))
+}
+
+fn chat_choice_text(value: &Value, key: &str) -> Option<String> {
+    let choices = value.get("choices")?.as_array()?;
+    let mut last = None;
+    for choice in choices {
+        let Some(text) = choice
+            .get(key)
+            .and_then(|item| item.get("content"))
+            .and_then(Value::as_str)
+        else {
+            continue;
+        };
+        last = Some(text.to_owned());
     }
     last
 }

@@ -902,9 +902,9 @@ Provider rejection, model noncompliance and documented translation limits are ob
 
 ## Traffic alignment
 
-The replay test checks that a Codex turn through infer produces the same upstream HTTP call the official Codex CLI would send to `https://chatgpt.com/backend-api/codex`. Harnesses are one module each under `src/traffic/`. Codex is the only one implemented. Grok Build and other first-party clients can be added as another module and another `tests/traffic/<harness>/fixtures` directory without changing the comparison code.
+The replay test checks that a Codex turn through infer produces the same upstream HTTP call the official Codex CLI would send to `https://chatgpt.com/backend-api/codex`. Harnesses are one module each under `src/traffic/`. Codex and Grok Build (`grok-build`) are implemented. Another first-party client is another module and another `tests/traffic/<harness>/fixtures` directory. The comparison code stays `src/traffic/normalize.rs`.
 
-`cargo test --locked -- --test-threads=1` replays the committed fixtures. It uses a loopback mock, dummy Codex auth, and no network. The mock returns the fixture's response stream. The test fails if infer's upstream method, path, query, JSON body, content-encoding, or compared headers differ from the fixture after the normalization rules in `src/traffic/normalize.rs`.
+`cargo test --locked -- --test-threads=1` replays the committed fixtures. It uses a loopback mock, dummy credentials, and no network. The mock returns the fixture's response stream. The test fails if infer's upstream method, path, query, JSON body, content-encoding, or compared headers differ from the fixture after the normalization rules in `src/traffic/normalize.rs`. `tests/traffic/grok-build/fixtures/` has no JSON fixtures yet, so that replay skips and says so. A recorded fixture copied there is compared.
 
 ### What is committed
 
@@ -939,6 +939,24 @@ Raw output stays in gitignored `traffic-recordings/codex/<scenario>/<timestamp>/
 * `fixture.json` is the scrubbed fixture.
 * `cli.stdout` and `cli.stderr` are local logs.
 
+### Grok Build
+
+`grok-build` records official `grok` 1.0.77 (`50ca579fa996`, the stamp `grok --version` prints). The command downloads that machine's binary from `https://x.ai/cli/` (Windows names end in `.exe`) and refuses to start unless the bytes match the SHA-256 pin in `src/traffic/grok_build.rs`. x.ai does not publish a checksum file. It is not run in CI.
+
+A signed-in CLI (`grok login`, OIDC or external session in `GROK_AUTH_PATH`, `GROK_HOME/auth.json`, or `~/.grok/auth.json`) is recorded at `https://cli-chat-proxy.grok.com`. The recorder sets `GROK_CLI_CHAT_PROXY_BASE_URL` to the local proxy plus `/v1`. A session wins over `XAI_API_KEY`, which is grok's own order. With no session, an `XAI_API_KEY` or `GROK_CODE_XAI_API_KEY` value, or an `auth_mode = "api_key"` entry, is recorded at `https://api.x.ai` through `GROK_XAI_API_BASE_URL`. A legacy `web_login` token is ignored by this grok build. The headless turn is `grok -p`, with `--model`, `--cwd` pointed at an empty git work directory, and `--always-approve` so a tool call does not wait on the TUI. The model has to be one `grok models` lists for that auth. `--always-approve` does not remove tools.
+
+```sh
+cargo run --bin traffic-record -- record \
+  --harness grok-build \
+  --scenario chat-turn \
+  --model MODEL \
+  --prompt 'Say hello in one word.'
+```
+
+`--harness` defaults to `codex`, and omitting `--model` still uses `gpt-5.5` for that harness. Raw output stays in gitignored `traffic-recordings/grok-build/<scenario>/<timestamp>/`. The fixture keeps `POST /v1/chat/completions` and `POST /v1/responses`. Other calls, including `GET /v1/models` and `GET /v1/api-key`, are omitted. Copy the reviewed `fixture.json` to `tests/traffic/grok-build/fixtures/<scenario>.json`.
+
+Replay sends that client request through the existing `kind = "grok"` provider. No separate grok-build backend was added. Compared headers include `accept`, `content-type`, and the `x-grok-*` request ids the sampler sends, plus `x-authenticateresponse`, `x-grok-client-version`, `x-grok-client-identifier`, and `x-grok-client-mode` when the CLI sent them. Absence matches too. `authorization`, `x-api-key`, and `X-XAI-Token-Auth` are scrubbed (the last name contains `token`). `x-email` and `x-grok-user-id` are dropped from the fixture and are not compared.
+
 ### Scrub, review, and re-record
 
 ```sh
@@ -947,6 +965,11 @@ cargo run --bin traffic-record -- scrub \
   --scenario chat-turn \
   --out /tmp/chat-turn.json
 cargo run --bin traffic-record -- check --fixtures tests/traffic/codex/fixtures
+cargo run --bin traffic-record -- scrub \
+  --harness grok-build \
+  --raw traffic-recordings/grok-build/chat-turn/TIMESTAMP/raw.json \
+  --scenario chat-turn \
+  --out /tmp/chat-turn.json
 ```
 
 Scrub runs on the decoded JSON strings. It removes auth and cookie headers (including `authorization` and `chatgpt-account-id`) and replaces bearer tokens, JWTs, `sk-` keys, email addresses, and long base64 runs inside those strings with stable placeholders. A body that is still an undecoded base64 blob makes `scrub` fail instead of replacing that blob with `<blob>`. The check fails if a fixture still contains those shapes. Copy a reviewed `fixture.json` over `tests/traffic/codex/fixtures/<scenario>.json`. The recorder sets `provenance` to `recorded`. Re-record by running `record` again and replacing that file. The replay sends one client request and expects one compared upstream call for each exchange left at `compare: true`.
