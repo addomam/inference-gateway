@@ -355,6 +355,42 @@ mod tests {
     }
 
     #[test]
+    fn scrub_covers_xai_auth_headers_and_bearer_keys() {
+        let dirty = json!({
+            "headers": {
+                "authorization": "Bearer xai-super-secret-token",
+                "x-api-key": "xai-another-secret-key",
+                "X-XAI-Token-Auth": "xai-grok-cli",
+                "x-email": "person@x.ai",
+                "x-grok-client-version": "1.0.77"
+            }
+        });
+        let clean = scrub_value(dirty);
+        let text = serde_json::to_string(&clean).unwrap();
+        assert!(findings(&text).is_empty(), "{text} {:?}", findings(&text));
+        assert!(!text.to_ascii_lowercase().contains("authorization"));
+        assert!(!text.contains("x-api-key"));
+        assert!(!text.to_ascii_lowercase().contains("x-xai-token-auth"));
+        assert!(!text.contains("xai-super-secret-token"));
+        assert!(!text.contains("xai-another-secret-key"));
+        assert!(!text.contains("xai-grok-cli"));
+        assert!(!text.contains("person@x.ai"));
+        assert!(text.contains("<email>"));
+        assert!(text.contains("1.0.77"));
+        let raw = "Bearer xai-super-secret-token \"x-api-key\" person@x.ai";
+        let found = findings(raw);
+        assert!(
+            found.iter().any(|item| item.contains("bearer")),
+            "{found:?}"
+        );
+        assert!(
+            found.iter().any(|item| item.contains("x-api-key")),
+            "{found:?}"
+        );
+        assert!(found.iter().any(|item| item.contains("email")), "{found:?}");
+    }
+
+    #[test]
     fn scanner_reports_each_shape() {
         assert!(findings("Bearer abcdefghij").contains(&"bearer token".to_owned()));
         assert!(findings("eyJhbGciOiJub25lIn0.eyJhIjoiYiJ9.signature").contains(&"JWT".to_owned()));

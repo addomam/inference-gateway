@@ -7,6 +7,7 @@
 
 pub mod codex;
 mod encoding;
+pub mod grok_build;
 mod harness;
 mod normalize;
 mod record;

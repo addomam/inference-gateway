@@ -20,7 +20,7 @@ __pycache__/
 
 # Private development records and publication staging.
 /specs/
-# Raw Codex CLI captures. Scrubbed fixtures live under tests/traffic.
+# Raw CLI captures (Codex and Grok Build). Scrubbed fixtures live under tests/traffic.
 /traffic-recordings/
 /scripts
 /tools/

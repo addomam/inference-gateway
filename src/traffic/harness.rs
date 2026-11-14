@@ -1,4 +1,4 @@
-//! One implementation per first-party client. Codex is the only harness so far.
+//! One implementation per first-party client. Codex and Grok Build are the harnesses.
 
 pub trait Harness: Send + Sync {
     fn id(&self) -> &'static str;
