@@ -218,11 +218,19 @@ async fn codex_upstream_matches_the_cli_fixture() -> Result<()> {
                 fixture.scenario
             );
         }
-        // The recorded completion is "Hello!"; the source-derived fixtures use
-        // lowercase. The check is the replayed word, not its capitalization.
-        if !text.to_ascii_lowercase().contains("hello") {
+        // The client observes the replayed completion, whatever the prompt was.
+        // Take the final output_text from the compared exchange's
+        // response.output_text.done, or from response.completed when that
+        // event is the one that carries it.
+        let expected_text = replayed_output_text(&fixture).with_context(|| {
+            format!(
+                "{} compared exchange has no output_text to observe",
+                fixture.scenario
+            )
+        })?;
+        if !text.contains(&expected_text) {
             bail!(
-                "{} client response did not contain the replayed text: {text}",
+                "{} client response did not contain the replayed text {expected_text:?}: {text}",
                 fixture.scenario
             );
         }
@@ -247,6 +255,73 @@ async fn codex_upstream_matches_the_cli_fixture() -> Result<()> {
         let _ = gateway;
     }
     Ok(())
+}
+
+/// Final assistant text a client can read from the compared replay.
+///
+/// Streaming captures carry it on `response.output_text.done`. A completed
+/// JSON response, or an SSE stream whose done event omitted `text`, carries
+/// the same string on the last `output_text` part of `response.completed`.
+fn replayed_output_text(fixture: &traffic::Fixture) -> Result<String> {
+    let mut text = None;
+    for exchange in fixture.exchanges.iter().filter(|exchange| exchange.compare) {
+        let bytes = exchange.response.bytes()?;
+        if let Some(found) = output_text_from_replay(&bytes)
+            && !found.is_empty()
+        {
+            text = Some(found);
+        }
+    }
+    text.with_context(|| format!("{} replay has no output_text", fixture.scenario))
+}
+
+fn output_text_from_replay(bytes: &[u8]) -> Option<String> {
+    if let Ok(events) = support::sse_events(bytes) {
+        let mut done = None;
+        let mut completed = None;
+        for event in events {
+            let Ok(value) = serde_json::from_str::<Value>(&event.data) else {
+                continue;
+            };
+            let kind = event
+                .event
+                .as_deref()
+                .or_else(|| value.get("type").and_then(Value::as_str))
+                .unwrap_or("");
+            if kind == "response.output_text.done" {
+                if let Some(text) = value.get("text").and_then(Value::as_str) {
+                    done = Some(text.to_owned());
+                }
+            } else if kind == "response.completed" {
+                completed = message_output_text(value.get("response").unwrap_or(&value));
+            }
+        }
+        if done.is_some() || completed.is_some() {
+            return done.or(completed);
+        }
+    }
+    serde_json::from_slice::<Value>(bytes)
+        .ok()
+        .as_ref()
+        .and_then(message_output_text)
+}
+
+fn message_output_text(value: &Value) -> Option<String> {
+    let mut last = None;
+    let output = value.get("output")?.as_array()?;
+    for item in output {
+        let Some(parts) = item.get("content").and_then(Value::as_array) else {
+            continue;
+        };
+        for part in parts {
+            if part.get("type").and_then(Value::as_str) == Some("output_text")
+                && let Some(text) = part.get("text").and_then(Value::as_str)
+            {
+                last = Some(text.to_owned());
+            }
+        }
+    }
+    last
 }
 
 #[tokio::test]

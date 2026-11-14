@@ -913,10 +913,10 @@ The replay test checks that a Codex turn through infer produces the same upstrea
 | Fixture | Client turn | Upstream shape |
 |---|---|---|
 | `chat-turn.json` | recorded `POST /v1/responses` with `stream: true` | `gpt-6.1-sol` `codex exec` turn |
-| `stream-turn.json` | `POST /v1/responses` with `stream: true` | `gpt-5.6-sol`, Responses Lite |
-| `tool-turn.json` | a non-streaming turn plus one function tool | `gpt-5.5`, tool array kept |
+| `stream-turn.json` | recorded `POST /v1/responses` with `stream: true` | `gpt-5.6-sol`, Responses Lite |
+| `tool-turn.json` | recorded `POST /v1/responses` with `stream: true` | `gpt-6.1-sol` shell tool; second `exec` turn is `compare: false` |
 
-`chat-turn.json` is a scrubbed capture from official `codex exec` `rust-v0.169.0` (`Say hello in one word.`, model `gpt-6.1-sol`). `stream-turn.json` and `tool-turn.json` are **source-derived, not packet captures**. They were read from openai/codex `69231e119bfca0b14453515e97d99688ce1c47c9` (`ResponsesApiRequest`, `build_responses_request`, session headers, and `default_headers`), the same tree as release `rust-v0.169.0`. Those two do not include session telemetry a live `codex exec` adds from its login: `client_metadata`, item ids, base instructions, and the built-in tool list. `prompt_cache_key` is the session id. A recording that contains other live-only fields will fail the comparison until infer matches them or `normalize.rs` gains an allowance with a comment.
+`chat-turn.json`, `stream-turn.json`, and `tool-turn.json` are scrubbed captures from official `codex exec` `rust-v0.169.0`. `chat-turn.json` is `Say hello in one word.` on `gpt-6.1-sol`. `stream-turn.json` is `Write three short sentences about rivers.` on `gpt-5.6-sol`, with `x-openai-internal-codex-responses-lite: true`. `tool-turn.json` asks Codex to run `echo traffic-ok` with its shell tool on `gpt-6.1-sol`. That capture has two `POST /responses` exchanges; the second, a `custom_tool_call` / `custom_tool_call_output` for tool `exec`, is `compare: false`. Each compared `client.body` is the captured request, including `client_metadata`, item ids, base instructions, and the built-in tool list. `prompt_cache_key` is the session id. A recording that contains other live-only fields fails the comparison until infer matches them or `normalize.rs` gains an allowance with a comment.
 
 ### Record
 
@@ -951,7 +951,7 @@ cargo run --bin traffic-record -- check --fixtures tests/traffic/codex/fixtures
 
 Scrub runs on the decoded JSON strings. It removes auth and cookie headers (including `authorization` and `chatgpt-account-id`) and replaces bearer tokens, JWTs, `sk-` keys, email addresses, and long base64 runs inside those strings with stable placeholders. A body that is still an undecoded base64 blob makes `scrub` fail instead of replacing that blob with `<blob>`. The check fails if a fixture still contains those shapes. Copy a reviewed `fixture.json` over `tests/traffic/codex/fixtures/<scenario>.json`. The recorder sets `provenance` to `recorded`. Re-record by running `record` again and replacing that file. The replay sends one client request and expects one compared upstream call for each exchange left at `compare: true`.
 
-For a non-streaming gateway client, edit the copied fixture's `client.body.stream` to `false` and leave the upstream `stream: true`. That is the `chat-turn` shape. For a live body that already matches the CLI, leave `client.body` equal to the captured body so the test checks that infer forwards it.
+For a non-streaming gateway client, edit the copied fixture's `client.body.stream` to `false` and leave the upstream `stream: true`. For a live body that already matches the CLI, leave `client.body` equal to the captured body so the test checks that infer forwards it. The three committed fixtures are that second shape.
 
 ### Normalization
 
