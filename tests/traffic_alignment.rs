@@ -387,19 +387,20 @@ async fn grok_provider_forwards_a_chat_completion() -> Result<()> {
 async fn grok_build_upstream_matches_the_cli_fixture() -> Result<()> {
     let dir = grok_build::fixture_dir();
     if !dir.is_dir() {
-        println!(
-            "skipping grok-build traffic alignment: {} does not exist. Record with `cargo run --bin traffic-record -- record --harness grok-build --scenario chat-turn --model <model> --prompt '...'`.",
-            dir.display()
-        );
-        return Ok(());
+        bail!("grok-build fixtures directory {} is missing", dir.display());
     }
     let fixtures = traffic::fixtures_in(&dir)?;
     if fixtures.is_empty() {
-        println!(
-            "skipping grok-build traffic alignment: {} has no JSON fixtures. Record with `cargo run --bin traffic-record -- record --harness grok-build --scenario chat-turn --model <model> --prompt '...'`, review fixture.json, and copy it here. No Recorded capture is committed yet.",
+        bail!(
+            "grok-build fixtures directory {} has no JSON fixtures. The recorded chat-turn must be replayed, not skipped.",
             dir.display()
         );
-        return Ok(());
+    }
+    if !fixtures
+        .iter()
+        .any(|(_, fixture)| fixture.provenance == traffic::Provenance::Recorded)
+    {
+        bail!("grok-build replay needs a recorded fixture");
     }
     assert_clean(&dir)?;
     for (path, fixture) in fixtures {

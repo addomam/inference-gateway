@@ -1098,6 +1098,9 @@ async fn send(
         );
     }
     crate::backend::get(provider.kind).prepare_headers(&mut headers, rewritten);
+    if provider.kind == crate::config::Kind::Grok {
+        crate::backend::stamp_grok_headers(&mut headers, url.path());
+    }
     if let Some(body) = &codex_body {
         crate::backend::stamp_codex_headers(&mut headers, body);
     }

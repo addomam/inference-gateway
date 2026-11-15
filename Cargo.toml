@@ -36,7 +36,7 @@ opentelemetry-otlp = { version = "0.33", default-features = false, features = ["
 tracing = "0.1"
 tracing-opentelemetry = "0.34"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
-uuid = { version = "1", features = ["v4"] }
+uuid = { version = "1", features = ["v4", "v5"] }
 zip = { version = "9", default-features = false, features = ["deflate-flate2-zlib-rs"] }
 zstd = { version = "0.13", default-features = false }
 

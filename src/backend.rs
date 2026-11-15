@@ -460,6 +460,82 @@ fn insert_if_absent(headers: &mut HeaderMap, name: &'static str, value: &str) {
     }
 }
 
+/// Prefix for `derive_conversation_group_id` in grok 1.0.77. UUIDv5 of the
+/// session id under the OID namespace. The committed chat-turn capture matches.
+const GROK_CONVERSATION_GROUP_PREFIX: &str = "xai:grok-build:conversation-group:";
+/// Detector window `x-grok-doom-loop-check` on the recorded streaming Responses turn.
+const GROK_DOOM_LOOP_WINDOW: &str = "1024";
+/// Exact-repetition minimum `x-grok-exact-repetition-check` on that same turn.
+const GROK_EXACT_REPETITION_TOKENS: &str = "64";
+
+/// Headers the official grok CLI derives on the way to cli-chat-proxy.
+///
+/// A caller-supplied value is kept. The conversation group id is UUIDv5 of
+/// `x-grok-session-id`. The doom-loop defaults are added only on a streaming
+/// Responses call that already carries grok-build client identity, which is
+/// where 1.0.77 sent `1024` and `64`. Chat completions and a buffered
+/// Responses call do not gain those two headers.
+pub(crate) fn stamp_grok_headers(headers: &mut HeaderMap, path: &str) {
+    if let Some(session) = header_text(headers, "x-grok-session-id") {
+        let group = grok_conversation_group_id(session);
+        insert_if_absent(headers, "x-grok-conv-group-id", &group);
+    }
+    if grok_responses_stream(path, headers) && grok_build_request(headers) {
+        insert_if_absent(headers, "x-grok-doom-loop-check", GROK_DOOM_LOOP_WINDOW);
+        insert_if_absent(
+            headers,
+            "x-grok-exact-repetition-check",
+            GROK_EXACT_REPETITION_TOKENS,
+        );
+    }
+}
+
+fn grok_conversation_group_id(session_id: &str) -> String {
+    uuid::Uuid::new_v5(
+        &uuid::Uuid::NAMESPACE_OID,
+        format!("{GROK_CONVERSATION_GROUP_PREFIX}{session_id}").as_bytes(),
+    )
+    .to_string()
+}
+
+fn grok_responses_stream(path: &str, headers: &HeaderMap) -> bool {
+    let path = path.split('?').next().unwrap_or(path);
+    path.trim_end_matches('/').ends_with("/responses") && accepts_event_stream(headers)
+}
+
+fn accepts_event_stream(headers: &HeaderMap) -> bool {
+    headers
+        .get(http::header::ACCEPT)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| {
+            value.split(',').any(|part| {
+                part.split(';')
+                    .next()
+                    .unwrap_or("")
+                    .trim()
+                    .eq_ignore_ascii_case("text/event-stream")
+            })
+        })
+}
+
+fn grok_build_request(headers: &HeaderMap) -> bool {
+    [
+        "x-grok-client-identifier",
+        "x-grok-client-version",
+        "x-grok-client-mode",
+        "x-authenticateresponse",
+    ]
+    .into_iter()
+    .any(|name| header_text(headers, name).is_some())
+}
+
+fn header_text<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
+    headers
+        .get(name)
+        .and_then(|value| value.to_str().ok())
+        .filter(|value| !value.is_empty())
+}
+
 struct OpenaiDecisions;
 
 impl Decisions for OpenaiDecisions {}
@@ -666,6 +742,83 @@ mod tests {
         );
         let value: Value = serde_json::from_slice(&kept).unwrap();
         assert_eq!(value["prompt_cache_key"], "keep");
+    }
+
+    #[test]
+    fn grok_stamp_derives_the_recorded_group_and_keeps_caller_values() {
+        let session = "01a1dc95-42fe-7082-92c0-f10036e5a6a9";
+        let mut headers = http::HeaderMap::new();
+        headers.insert("x-grok-session-id", http::HeaderValue::from_static(session));
+        headers.insert(
+            "x-grok-client-identifier",
+            http::HeaderValue::from_static("grok-shell"),
+        );
+        headers.insert(
+            http::header::ACCEPT,
+            http::HeaderValue::from_static("text/event-stream"),
+        );
+        stamp_grok_headers(&mut headers, "/v1/responses");
+        assert_eq!(
+            headers["x-grok-conv-group-id"],
+            "247d90df-b575-5cd7-b714-44e0ed9d09f3"
+        );
+        assert_eq!(headers["x-grok-doom-loop-check"], "1024");
+        assert_eq!(headers["x-grok-exact-repetition-check"], "64");
+
+        headers.insert(
+            "x-grok-conv-group-id",
+            http::HeaderValue::from_static("11111111-1111-4111-8111-111111111111"),
+        );
+        headers.insert(
+            "x-grok-doom-loop-check",
+            http::HeaderValue::from_static("2048"),
+        );
+        stamp_grok_headers(&mut headers, "/v1/responses");
+        assert_eq!(
+            headers["x-grok-conv-group-id"],
+            "11111111-1111-4111-8111-111111111111"
+        );
+        assert_eq!(headers["x-grok-doom-loop-check"], "2048");
+
+        let mut chat = http::HeaderMap::new();
+        chat.insert("x-grok-session-id", http::HeaderValue::from_static(session));
+        chat.insert(
+            "x-grok-client-identifier",
+            http::HeaderValue::from_static("grok-shell"),
+        );
+        chat.insert(
+            http::header::ACCEPT,
+            http::HeaderValue::from_static("text/event-stream"),
+        );
+        stamp_grok_headers(&mut chat, "/v1/chat/completions");
+        assert_eq!(
+            chat["x-grok-conv-group-id"],
+            "247d90df-b575-5cd7-b714-44e0ed9d09f3"
+        );
+        assert!(chat.get("x-grok-doom-loop-check").is_none());
+        assert!(chat.get("x-grok-exact-repetition-check").is_none());
+
+        let mut buffered = http::HeaderMap::new();
+        buffered.insert("x-grok-session-id", http::HeaderValue::from_static(session));
+        buffered.insert(
+            "x-authenticateresponse",
+            http::HeaderValue::from_static("authenticate-response"),
+        );
+        buffered.insert(
+            http::header::ACCEPT,
+            http::HeaderValue::from_static("application/json"),
+        );
+        stamp_grok_headers(&mut buffered, "/v1/responses");
+        assert!(buffered.get("x-grok-doom-loop-check").is_none());
+
+        let mut plain = http::HeaderMap::new();
+        plain.insert(
+            http::header::ACCEPT,
+            http::HeaderValue::from_static("text/event-stream"),
+        );
+        stamp_grok_headers(&mut plain, "/v1/responses");
+        assert!(plain.get("x-grok-conv-group-id").is_none());
+        assert!(plain.get("x-grok-doom-loop-check").is_none());
     }
 
     #[test]
