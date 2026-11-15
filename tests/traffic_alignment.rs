@@ -21,6 +21,11 @@ use serde_json::{Map, Value, json};
 use support::Gateway;
 use tokio::sync::Mutex as AsyncMutex;
 
+const CODEX_ORIGINATED_USER_AGENT: &str =
+    "codex_exec/0.169.0 (Linux Unknown; x86_64) unknown (codex_exec; 0.169.0)";
+const GROK_ORIGINATED_USER_AGENT: &str = "grok-shell/1.0.77 (linux; x86_64)";
+const RECORDED_GROK_TRACE_ID: &str = "ec2dbe8943832cb3ce012bca4a4988f3";
+
 struct Reply {
     status: u16,
     headers: Map<String, Value>,
@@ -182,9 +187,7 @@ async fn codex_upstream_matches_the_cli_fixture() -> Result<()> {
             };
             request = request.header(name, text);
         }
-        let response = request
-            .json(&fixture.client.body)
-            .send()
+        let response = send_fixture(&gateway.client, request.json(&fixture.client.body))
             .await
             .with_context(|| format!("send {}", fixture.scenario))?;
         let status = response.status();
@@ -252,6 +255,24 @@ async fn codex_upstream_matches_the_cli_fixture() -> Result<()> {
                     fixture.scenario
                 )
             })?;
+            assert_eq!(
+                actual.headers.get("user-agent").and_then(Value::as_str),
+                Some(CODEX_ORIGINATED_USER_AGENT),
+                "{} exchange {index} user-agent",
+                fixture.scenario
+            );
+            let traceparent = actual
+                .headers
+                .get("traceparent")
+                .and_then(Value::as_str)
+                .with_context(|| format!("{} exchange {index} traceparent", fixture.scenario))?;
+            assert_fresh_traceparent(traceparent)
+                .with_context(|| format!("{} exchange {index} traceparent", fixture.scenario))?;
+            assert!(
+                actual.headers.get("x-codex-beta-features").is_none(),
+                "{} exchange {index} invented x-codex-beta-features",
+                fixture.scenario
+            );
         }
         let _ = gateway;
     }
@@ -379,6 +400,20 @@ async fn grok_provider_forwards_a_chat_completion() -> Result<()> {
     if sent["model"] != "grok-4" || sent["messages"][0]["content"] != "Hello" {
         bail!("grok provider rewrote the chat body: {sent}");
     }
+    let user_agent = actual[0]
+        .headers
+        .get("user-agent")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    if user_agent == GROK_ORIGINATED_USER_AGENT || user_agent.contains("macos") {
+        bail!("plain grok chat originated a grok-build user-agent: {user_agent}");
+    }
+    let traceparent = actual[0]
+        .headers
+        .get("traceparent")
+        .and_then(Value::as_str)
+        .context("plain grok chat traceparent")?;
+    assert_fresh_traceparent(traceparent)?;
     let _ = gateway;
     Ok(())
 }
@@ -443,9 +478,7 @@ async fn grok_build_upstream_matches_the_cli_fixture() -> Result<()> {
             };
             request = request.header(name, text);
         }
-        let response = request
-            .json(&fixture.client.body)
-            .send()
+        let response = send_fixture(&gateway.client, request.json(&fixture.client.body))
             .await
             .with_context(|| format!("send {}", fixture.scenario))?;
         let status = response.status();
@@ -512,6 +545,29 @@ async fn grok_build_upstream_matches_the_cli_fixture() -> Result<()> {
                     fixture.scenario
                 )
             })?;
+            assert_eq!(
+                actual.headers.get("user-agent").and_then(Value::as_str),
+                Some(GROK_ORIGINATED_USER_AGENT),
+                "{} exchange {index} user-agent",
+                fixture.scenario
+            );
+            let traceparent = actual
+                .headers
+                .get("traceparent")
+                .and_then(Value::as_str)
+                .with_context(|| format!("{} exchange {index} traceparent", fixture.scenario))?;
+            assert_fresh_traceparent(traceparent)
+                .with_context(|| format!("{} exchange {index} traceparent", fixture.scenario))?;
+            assert!(
+                actual.headers.get("x-compaction-at").is_none(),
+                "{} exchange {index} invented x-compaction-at",
+                fixture.scenario
+            );
+            assert!(
+                actual.headers.get("x-compactions-remaining").is_none(),
+                "{} exchange {index} invented x-compactions-remaining",
+                fixture.scenario
+            );
         }
         let _ = gateway;
     }
@@ -573,6 +629,297 @@ fn chat_choice_text(value: &Value, key: &str) -> Option<String> {
         last = Some(text.to_owned());
     }
     last
+}
+
+/// The test client is reqwest, which supplies its own User-Agent. Fixture
+/// clients omit that header, so drop the library default before sending.
+async fn send_fixture(
+    client: &reqwest::Client,
+    builder: reqwest::RequestBuilder,
+) -> Result<reqwest::Response> {
+    let mut request = builder.build().context("build request")?;
+    request.headers_mut().remove(reqwest::header::USER_AGENT);
+    client.execute(request).await.context("send request")
+}
+
+fn assert_fresh_traceparent(value: &str) -> Result<()> {
+    let mut parts = value.split('-');
+    let version = parts.next();
+    let trace = parts.next().unwrap_or("");
+    let parent = parts.next().unwrap_or("");
+    let flags = parts.next();
+    if version != Some("00")
+        || flags != Some("01")
+        || parts.next().is_some()
+        || trace.len() != 32
+        || parent.len() != 16
+        || !trace.chars().all(|ch| ch.is_ascii_hexdigit())
+        || !parent.chars().all(|ch| ch.is_ascii_hexdigit())
+        || trace.chars().all(|ch| ch == '0')
+        || parent.chars().all(|ch| ch == '0')
+    {
+        bail!("traceparent {value} is not a sampled W3C id");
+    }
+    if trace == RECORDED_GROK_TRACE_ID
+        || parent == "13d799ca13cbe621"
+        || parent == "dea86bc10009a204"
+    {
+        bail!("traceparent {value} reuses a fixture id");
+    }
+    Ok(())
+}
+
+fn completed_sse() -> Vec<u8> {
+    concat!(
+        "event: response.completed\n",
+        "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"r\",\"status\":\"completed\",\"output\":[{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"pong\"}]}],\"usage\":{}}}\n\n"
+    )
+    .into()
+}
+
+async fn sse_reply() -> Result<Reply> {
+    Ok(Reply {
+        status: 200,
+        headers: json!({"content-type": "text/event-stream"})
+            .as_object()
+            .cloned()
+            .context("sse content-type")?,
+        body: completed_sse(),
+    })
+}
+
+async fn post_json(
+    client: &reqwest::Client,
+    url: &str,
+    proxy_token: &str,
+    body: &Value,
+    headers: &[(&str, &str)],
+    omit_user_agent: bool,
+) -> Result<()> {
+    let mut request = client.post(url).header("x-infer-key", proxy_token);
+    for (name, value) in headers {
+        request = request.header(*name, *value);
+    }
+    let mut built = request.json(body).build().context("build request")?;
+    if omit_user_agent {
+        built.headers_mut().remove(reqwest::header::USER_AGENT);
+    }
+    let response = client.execute(built).await.context("send request")?;
+    let status = response.status();
+    let text = response.text().await.context("read response")?;
+    if !status.is_success() {
+        bail!("gateway returned {status}: {text}");
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn caller_markers_are_forwarded_and_omitted_ones_stay_absent() -> Result<()> {
+    let mock = Mock::start(vec![
+        sse_reply().await?,
+        sse_reply().await?,
+        sse_reply().await?,
+    ])
+    .await?;
+    let auth_root = tempfile::tempdir()?;
+    let auth = auth_root.path().join("auth.json");
+    std::fs::write(
+        &auth,
+        serde_json::to_vec(&json!({
+            "tokens": {"access_token": "opaque-ready-token", "account_id": "account-test"}
+        }))?,
+    )?;
+    let gateway = Gateway::start("codex", &mock.base, "gpt-5.5", Some(&auth)).await?;
+    let codex_url = format!("{}/v1/responses", gateway.base);
+    let plain = json!({"model": "gpt-5.5", "input": "ping"});
+    post_json(
+        &gateway.client,
+        &codex_url,
+        &gateway.proxy_token,
+        &plain,
+        &[],
+        true,
+    )
+    .await?;
+    post_json(
+        &gateway.client,
+        &codex_url,
+        &gateway.proxy_token,
+        &plain,
+        &[],
+        true,
+    )
+    .await?;
+    post_json(
+        &gateway.client,
+        &codex_url,
+        &gateway.proxy_token,
+        &json!({
+            "model": "gpt-5.5",
+            "input": "ping",
+            "client_metadata": {"keep": "yes"}
+        }),
+        &[
+            ("user-agent", "Caller/1.2 (Test)"),
+            (
+                "traceparent",
+                "00-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-bbbbbbbbbbbbbbbb-00",
+            ),
+            ("x-codex-beta-features", "remote_compaction_v2"),
+        ],
+        false,
+    )
+    .await?;
+    let actual = mock.captured();
+    if actual.len() != 3 {
+        bail!("codex marker probe made {} upstream call(s)", actual.len());
+    }
+    let mut generated = Vec::new();
+    for call in &actual[..2] {
+        assert_eq!(
+            call.headers.get("user-agent").and_then(Value::as_str),
+            Some(CODEX_ORIGINATED_USER_AGENT)
+        );
+        let traceparent = call
+            .headers
+            .get("traceparent")
+            .and_then(Value::as_str)
+            .context("generated traceparent")?;
+        assert_fresh_traceparent(traceparent)?;
+        generated.push(traceparent.to_owned());
+        if call.headers.get("x-codex-beta-features").is_some() {
+            bail!("omitted x-codex-beta-features was invented");
+        }
+        let body: Value = serde_json::from_slice(&call.body).context("codex body")?;
+        if body.get("client_metadata").is_some() {
+            bail!("omitted client_metadata was invented: {body}");
+        }
+    }
+    if generated[0] == generated[1] {
+        bail!("two requests reused traceparent {}", generated[0]);
+    }
+    let forwarded = &actual[2];
+    assert_eq!(
+        forwarded.headers.get("user-agent").and_then(Value::as_str),
+        Some("Caller/1.2 (Test)")
+    );
+    assert_eq!(
+        forwarded.headers.get("traceparent").and_then(Value::as_str),
+        Some("00-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-bbbbbbbbbbbbbbbb-00")
+    );
+    assert_eq!(
+        forwarded
+            .headers
+            .get("x-codex-beta-features")
+            .and_then(Value::as_str),
+        Some("remote_compaction_v2")
+    );
+    let body: Value = serde_json::from_slice(&forwarded.body).context("forwarded body")?;
+    if body["client_metadata"]["keep"] != "yes" {
+        bail!("caller client_metadata was dropped: {body}");
+    }
+    let _ = gateway;
+
+    let grok_mock = Mock::start(vec![sse_reply().await?, sse_reply().await?]).await?;
+    let grok = Gateway::start("grok", &grok_mock.base, "grok-4", None).await?;
+    let grok_url = format!("{}/v1/responses", grok.base);
+    let grok_body = json!({"model": "grok-4", "input": "ping", "stream": true});
+    post_json(
+        &grok.client,
+        &grok_url,
+        &grok.proxy_token,
+        &grok_body,
+        &[
+            ("x-grok-client-identifier", "grok-shell"),
+            ("accept", "text/event-stream"),
+        ],
+        true,
+    )
+    .await?;
+    post_json(
+        &grok.client,
+        &grok_url,
+        &grok.proxy_token,
+        &grok_body,
+        &[
+            ("x-grok-client-identifier", "grok-shell"),
+            ("accept", "text/event-stream"),
+            ("user-agent", "Caller/1.2 (Test)"),
+            (
+                "traceparent",
+                "00-cccccccccccccccccccccccccccccccc-dddddddddddddddd-01",
+            ),
+            ("x-compaction-at", "204800"),
+            ("x-compactions-remaining", "1"),
+        ],
+        false,
+    )
+    .await?;
+    let grok_actual = grok_mock.captured();
+    if grok_actual.len() != 2 {
+        bail!(
+            "grok marker probe made {} upstream call(s)",
+            grok_actual.len()
+        );
+    }
+    assert_eq!(
+        grok_actual[0]
+            .headers
+            .get("user-agent")
+            .and_then(Value::as_str),
+        Some(GROK_ORIGINATED_USER_AGENT)
+    );
+    let grok_trace = grok_actual[0]
+        .headers
+        .get("traceparent")
+        .and_then(Value::as_str)
+        .context("grok generated traceparent")?;
+    assert_fresh_traceparent(grok_trace)?;
+    if grok_actual[0].headers.get("x-compaction-at").is_some()
+        || grok_actual[0]
+            .headers
+            .get("x-compactions-remaining")
+            .is_some()
+    {
+        bail!(
+            "omitted compaction headers were invented: {:?}",
+            grok_actual[0].headers
+        );
+    }
+    let grok_body: Value = serde_json::from_slice(&grok_actual[0].body).context("grok body")?;
+    if grok_body.get("client_metadata").is_some() {
+        bail!("grok invented client_metadata: {grok_body}");
+    }
+    assert_eq!(
+        grok_actual[1]
+            .headers
+            .get("user-agent")
+            .and_then(Value::as_str),
+        Some("Caller/1.2 (Test)")
+    );
+    assert_eq!(
+        grok_actual[1]
+            .headers
+            .get("traceparent")
+            .and_then(Value::as_str),
+        Some("00-cccccccccccccccccccccccccccccccc-dddddddddddddddd-01")
+    );
+    assert_eq!(
+        grok_actual[1]
+            .headers
+            .get("x-compaction-at")
+            .and_then(Value::as_str),
+        Some("204800")
+    );
+    assert_eq!(
+        grok_actual[1]
+            .headers
+            .get("x-compactions-remaining")
+            .and_then(Value::as_str),
+        Some("1")
+    );
+    let _ = grok;
+    Ok(())
 }
 
 #[tokio::test]

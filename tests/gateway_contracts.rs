@@ -3135,7 +3135,16 @@ async fn codex_models_discovery_is_cached_and_shapes_the_next_completion() -> Re
     assert_eq!(discovered.headers["originator"], "codex_exec");
     assert_eq!(discovered.headers["chatgpt-account-id"], "account-test");
     assert_eq!(discovered.headers["version"], "0.169.0");
-    assert_eq!(discovered.headers["user-agent"], "codex_exec/0.169.0");
+    assert_eq!(
+        discovered.headers["user-agent"],
+        "codex_exec/0.169.0 (Linux Unknown; x86_64) unknown (codex_exec; 0.169.0)"
+    );
+    let traceparent = discovered.headers["traceparent"].to_str().unwrap();
+    assert!(
+        traceparent.starts_with("00-") && traceparent.ends_with("-01"),
+        "{traceparent}"
+    );
+    assert_eq!(traceparent.len(), 55, "{traceparent}");
     assert!(discovered.headers.get("session-id").is_none());
     assert!(fixture.captured.try_recv().is_err());
 
