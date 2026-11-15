@@ -10,11 +10,15 @@
 //! The base URL is not a flag on that command. `grok agent` has
 //! `--cli-chat-proxy-base-url` and `--xai-api-base-url`; the same overrides are the
 //! environment variables `GROK_CLI_CHAT_PROXY_BASE_URL` and `GROK_XAI_API_BASE_URL`.
-//! Running 1.0.77 against a loopback listener with `XAI_API_KEY` set showed
-//! `GET /v1/api-key` only when `GROK_XAI_API_BASE_URL` pointed at that listener.
-//! `XAI_API_BASE_URL` was not consulted. Session inference uses the cli-chat-proxy
-//! (`EndpointsConfig::proxy_url` in the public xai-org/grok-build tree). That tree's
-//! `SOURCE_REV` is not `50ca579fa996`; the binary stamp is what this pin follows.
+//! A logged-in grok.com session on 1.0.77 honors `GROK_CLI_CHAT_PROXY_BASE_URL`.
+//! The committed `chat-turn` capture was made by pointing that variable at the
+//! local recorder: the generation request arrived with `Host: 127.0.0.1`, and the
+//! recorder forwarded it to `https://cli-chat-proxy.grok.com`. With `XAI_API_KEY`
+//! and no session, `GROK_XAI_API_BASE_URL` is the override that receives
+//! `GET /v1/api-key`. `XAI_API_BASE_URL` was not consulted. Session inference uses
+//! the cli-chat-proxy (`EndpointsConfig::proxy_url` in the public xai-org/grok-build
+//! tree). That tree's `SOURCE_REV` is not `50ca579fa996`; the binary stamp is what
+//! this pin follows.
 //!
 //! `is_cli_chat_proxy_url` treats `127.0.0.1` as the chat proxy, so a recording
 //! proxy on loopback still receives the first-party proxy headers.
@@ -66,23 +70,37 @@ impl Harness for GrokBuild {
             "accept",
             "content-type",
             // Present on cli-chat-proxy calls, including a loopback override.
+            // The 1.0.77 session capture sent `authenticate-response`.
             // Absent on the public API. Absence is compared.
             "x-authenticateresponse",
             "x-grok-agent-id",
             "x-grok-client-identifier",
             "x-grok-client-mode",
             "x-grok-client-version",
+            // UUIDv5 of `x-grok-session-id`. infer fills it when the caller omits it.
+            "x-grok-conv-group-id",
             "x-grok-conv-id",
+            // Optional. Absent on the committed turn. Absence is compared.
             "x-grok-deployment-id",
+            // Streaming Responses only. The committed turn sent the CLI defaults.
+            // Chat completions and a buffered Responses call omit them.
+            "x-grok-doom-loop-check",
+            "x-grok-exact-repetition-check",
             "x-grok-model-override",
             "x-grok-req-id",
             "x-grok-session-id",
+            // Optional. Absent on the first attempt. Absence is compared.
             "x-grok-transient-retry",
             "x-grok-turn-idx",
         ]
     }
 
     fn forbidden_headers(&self) -> &'static [&'static str] {
+        // The 1.0.77 capture has no header infer must refuse to send.
+        // `X-XAI-Token-Auth` is a chat-proxy marker the CLI does send, but scrub
+        // drops any header whose name contains "token", so the fixture cannot
+        // require it. Credential headers are replaced by the provider credential
+        // and are not part of this list.
         &[]
     }
 }
@@ -384,6 +402,48 @@ fn hex(bytes: &[u8]) -> String {
 mod tests {
     use super::*;
     use crate::traffic::scrub::findings;
+
+    #[test]
+    fn compared_headers_follow_the_recorded_turn() {
+        let compared = GROK_BUILD.compared_headers();
+        for name in [
+            "accept",
+            "content-type",
+            "x-authenticateresponse",
+            "x-grok-agent-id",
+            "x-grok-client-identifier",
+            "x-grok-client-mode",
+            "x-grok-client-version",
+            "x-grok-conv-group-id",
+            "x-grok-conv-id",
+            "x-grok-deployment-id",
+            "x-grok-doom-loop-check",
+            "x-grok-exact-repetition-check",
+            "x-grok-model-override",
+            "x-grok-req-id",
+            "x-grok-session-id",
+            "x-grok-transient-retry",
+            "x-grok-turn-idx",
+        ] {
+            assert!(compared.contains(&name), "{name}");
+        }
+        // Session compaction state, a per-request trace id, the machine
+        // user-agent, and framing are not the contract. See the README.
+        for name in [
+            "traceparent",
+            "user-agent",
+            "x-compaction-at",
+            "x-compactions-remaining",
+            "host",
+            "content-length",
+            "accept-encoding",
+            "authorization",
+            "x-api-key",
+        ] {
+            assert!(!compared.contains(&name), "{name}");
+        }
+        assert!(GROK_BUILD.forbidden_headers().is_empty());
+    }
 
     #[test]
     fn pinned_digests_match_the_official_linux_binary() {
