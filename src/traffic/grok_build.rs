@@ -427,8 +427,9 @@ mod tests {
         ] {
             assert!(compared.contains(&name), "{name}");
         }
-        // Session compaction state, a per-request trace id, the machine
-        // user-agent, and framing are not the contract. See the README.
+        // Compaction budgets, a per-request traceparent, and the user-agent are
+        // forwarded or pinned outside this comparison. See the README. Framing
+        // stays out too.
         for name in [
             "traceparent",
             "user-agent",

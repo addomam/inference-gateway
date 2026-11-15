@@ -334,9 +334,23 @@ impl Backend for Codex {
 /// `codex exec` sets this originator. `default_headers` alone still says
 /// `codex_cli_rs`; the exec binary overrides it before any request.
 const CODEX_ORIGINATOR: &str = "codex_exec";
-/// Product token only. OS, architecture, terminal, and the parenthetical
-/// suffix come from the machine that ran the CLI and are not invented here.
-const CODEX_USER_AGENT: &str = "codex_exec/0.169.0";
+/// Originated Codex `User-Agent`, pinned to the official `get_codex_user_agent`
+/// shape at openai/codex `69231e119bfca0b14453515e97d99688ce1c47c9`
+/// (`codex-rs/login/src/auth/default_client.rs`):
+/// `{originator}/{version} ({os_type} {os_version}; {arch}) {terminal} ({originator}; {version})`.
+///
+/// `Linux` and `Unknown` are os_info's names for a generic Linux install whose
+/// version is not known. `x86_64` is that crate's architecture token for the
+/// generic target. `unknown` is the terminal detector's fallback. The trailing
+/// `(codex_exec; 0.169.0)` is the exec user-agent suffix `{name}; {version}`.
+/// The whole string is a constant. It is not read from the gateway process, and
+/// it is not the recording machine's `Mac OS 27.2.0; arm64` or its terminal.
+pub(crate) const CODEX_USER_AGENT: &str =
+    "codex_exec/0.169.0 (Linux Unknown; x86_64) unknown (codex_exec; 0.169.0)";
+/// Originated grok-build `User-Agent`. The 1.0.77 capture sent
+/// `grok-shell/1.0.77 (macos; aarch64)`. The parenthetical is pinned to a
+/// generic linux/x86_64 and is not read from the gateway host.
+pub(crate) const GROK_BUILD_USER_AGENT: &str = "grok-shell/1.0.77 (linux; x86_64)";
 
 pub(crate) fn apply_codex_identity(headers: &mut HeaderMap) {
     headers.insert("originator", HeaderValue::from_static(CODEX_ORIGINATOR));
@@ -344,7 +358,7 @@ pub(crate) fn apply_codex_identity(headers: &mut HeaderMap) {
         "version",
         HeaderValue::from_static(crate::codex_models::CODEX_CLIENT_VERSION),
     );
-    headers.insert("user-agent", HeaderValue::from_static(CODEX_USER_AGENT));
+    insert_if_absent(headers, "user-agent", CODEX_USER_AGENT);
     headers.remove("openai-beta");
 }
 
@@ -476,6 +490,9 @@ const GROK_EXACT_REPETITION_TOKENS: &str = "64";
 /// where 1.0.77 sent `1024` and `64`. Chat completions and a buffered
 /// Responses call do not gain those two headers.
 pub(crate) fn stamp_grok_headers(headers: &mut HeaderMap, path: &str) {
+    if grok_build_request(headers) {
+        insert_if_absent(headers, "user-agent", GROK_BUILD_USER_AGENT);
+    }
     if let Some(session) = header_text(headers, "x-grok-session-id") {
         let group = grok_conversation_group_id(session);
         insert_if_absent(headers, "x-grok-conv-group-id", &group);
@@ -534,6 +551,22 @@ fn header_text<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
         .get(name)
         .and_then(|value| value.to_str().ok())
         .filter(|value| !value.is_empty())
+}
+
+/// Keep a caller-supplied `traceparent`. Otherwise mint a new W3C value for
+/// this request: version `00`, a random 16-byte trace id, a random 8-byte
+/// parent id, and the sampled flag `01`.
+pub(crate) fn ensure_traceparent(headers: &mut HeaderMap) {
+    if headers.contains_key("traceparent") {
+        return;
+    }
+    insert_header(headers, "traceparent", &fresh_traceparent());
+}
+
+fn fresh_traceparent() -> String {
+    let trace = uuid::Uuid::new_v4().simple().to_string();
+    let parent = uuid::Uuid::new_v4().simple().to_string();
+    format!("00-{trace}-{}-01", &parent[..16])
 }
 
 struct OpenaiDecisions;
@@ -672,13 +705,14 @@ mod tests {
             headers["version"],
             crate::codex_models::CODEX_CLIENT_VERSION
         );
-        assert_eq!(headers["user-agent"], "codex_exec/0.169.0");
-        assert!(
-            headers["user-agent"]
-                .to_str()
-                .unwrap()
-                .ends_with(crate::codex_models::CODEX_CLIENT_VERSION)
+        assert_eq!(headers["user-agent"], CODEX_USER_AGENT);
+        let mut kept = http::HeaderMap::new();
+        kept.insert(
+            http::header::USER_AGENT,
+            http::HeaderValue::from_static("caller-agent/9"),
         );
+        get(Kind::Codex).prepare_headers(&mut kept, true);
+        assert_eq!(kept["user-agent"], "caller-agent/9");
         assert_eq!(headers["accept"], "text/event-stream");
         assert!(headers.get("openai-beta").is_none());
         assert_eq!(headers["session-id"], headers["thread-id"]);
@@ -819,6 +853,79 @@ mod tests {
         stamp_grok_headers(&mut plain, "/v1/responses");
         assert!(plain.get("x-grok-conv-group-id").is_none());
         assert!(plain.get("x-grok-doom-loop-check").is_none());
+        assert!(plain.get("user-agent").is_none());
+        assert_eq!(headers["user-agent"], GROK_BUILD_USER_AGENT);
+        assert_eq!(chat["user-agent"], GROK_BUILD_USER_AGENT);
+        headers.insert(
+            "user-agent",
+            http::HeaderValue::from_static("caller-agent/9"),
+        );
+        stamp_grok_headers(&mut headers, "/v1/responses");
+        assert_eq!(headers["user-agent"], "caller-agent/9");
+        assert!(headers.get("x-compaction-at").is_none());
+        assert!(headers.get("x-compactions-remaining").is_none());
+    }
+
+    #[test]
+    fn originated_user_agents_are_pinned_generic_linux_tokens() {
+        assert_eq!(
+            CODEX_USER_AGENT,
+            "codex_exec/0.169.0 (Linux Unknown; x86_64) unknown (codex_exec; 0.169.0)"
+        );
+        assert_eq!(GROK_BUILD_USER_AGENT, "grok-shell/1.0.77 (linux; x86_64)");
+        assert!(CODEX_USER_AGENT.starts_with("codex_exec/0.169.0 "));
+        for marker in ["Mac OS", "macos", "aarch64", "arm64", "ghostty", "dumb"] {
+            assert!(
+                !CODEX_USER_AGENT.contains(marker),
+                "{CODEX_USER_AGENT} contains {marker}"
+            );
+            assert!(
+                !GROK_BUILD_USER_AGENT.contains(marker),
+                "{GROK_BUILD_USER_AGENT} contains {marker}"
+            );
+        }
+    }
+
+    #[test]
+    fn traceparent_is_fresh_sampled_and_keeps_a_caller_value() {
+        let mut headers = http::HeaderMap::new();
+        ensure_traceparent(&mut headers);
+        let first = headers["traceparent"].to_str().unwrap().to_owned();
+        assert_sampled_traceparent(&first);
+        headers.clear();
+        ensure_traceparent(&mut headers);
+        let second = headers["traceparent"].to_str().unwrap().to_owned();
+        assert_sampled_traceparent(&second);
+        assert_ne!(first, second);
+        headers.insert(
+            "traceparent",
+            http::HeaderValue::from_static(
+                "00-ec2dbe8943832cb3ce012bca4a4988f3-13d799ca13cbe621-01",
+            ),
+        );
+        ensure_traceparent(&mut headers);
+        assert_eq!(
+            headers["traceparent"],
+            "00-ec2dbe8943832cb3ce012bca4a4988f3-13d799ca13cbe621-01"
+        );
+    }
+
+    fn assert_sampled_traceparent(value: &str) {
+        let mut parts = value.split('-');
+        assert_eq!(parts.next(), Some("00"), "{value}");
+        let trace = parts.next().unwrap_or("");
+        let parent = parts.next().unwrap_or("");
+        assert_eq!(parts.next(), Some("01"), "{value}");
+        assert!(parts.next().is_none(), "{value}");
+        assert_eq!(trace.len(), 32, "{value}");
+        assert_eq!(parent.len(), 16, "{value}");
+        assert!(trace.chars().all(|ch| ch.is_ascii_hexdigit()), "{value}");
+        assert!(parent.chars().all(|ch| ch.is_ascii_hexdigit()), "{value}");
+        assert_ne!(trace, "0".repeat(32), "{value}");
+        assert_ne!(parent, "0".repeat(16), "{value}");
+        assert_ne!(trace, "ec2dbe8943832cb3ce012bca4a4988f3", "{value}");
+        assert_ne!(parent, "13d799ca13cbe621", "{value}");
+        assert_ne!(parent, "dea86bc10009a204", "{value}");
     }
 
     #[test]

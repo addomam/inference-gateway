@@ -1023,6 +1023,13 @@ async fn upload_provider_file(
         HeaderValue::from_str(&format!("multipart/form-data; boundary={boundary}"))?,
     );
     headers.insert("accept-encoding", HeaderValue::from_static("identity"));
+    if let Some(value) = incoming.get(http::header::USER_AGENT) {
+        headers.insert(http::header::USER_AGENT, value.clone());
+    }
+    if let Some(value) = incoming.get("traceparent") {
+        headers.insert("traceparent", value.clone());
+    }
+    crate::backend::ensure_traceparent(&mut headers);
     if provider.kind == crate::config::Kind::Anthropic {
         headers.insert("anthropic-version", HeaderValue::from_static("2023-06-01"));
         headers.insert(
@@ -1110,6 +1117,7 @@ async fn send(
             HeaderValue::from_static("true"),
         );
     }
+    crate::backend::ensure_traceparent(&mut headers);
     if let Some(w) = writer.lock().await.as_mut() {
         w.route(name, url.as_str(), headers_json(&headers)).await?;
     }
@@ -1227,6 +1235,7 @@ async fn discover_codex_models(
                 HeaderValue::from_static("application/json"),
             );
             headers.insert("accept-encoding", HeaderValue::from_static("identity"));
+            crate::backend::ensure_traceparent(&mut headers);
             headers
         }
         Err(error) => {
@@ -4177,6 +4186,7 @@ mod tests {
             proxy_token: Arc::new("test-gateway-token".into()),
             codex_models: Arc::new(crate::codex_models::Catalog::default()),
         };
+        let mut traceparents = Vec::new();
         for model in ["gpt-5.1-codex", "gpt-4o-mini"] {
             let response = inference(
                 State(app.clone()),
@@ -4208,7 +4218,14 @@ mod tests {
             assert_eq!(upstream["tool_choice"], "auto");
             assert_eq!(headers["originator"], "codex_exec");
             assert_eq!(headers["version"], "0.169.0");
-            assert_eq!(headers["user-agent"], "codex_exec/0.169.0");
+            assert_eq!(headers["user-agent"], crate::backend::CODEX_USER_AGENT);
+            let traceparent = headers["traceparent"].to_str().unwrap();
+            assert_eq!(traceparent.len(), 55);
+            assert!(traceparent.starts_with("00-") && traceparent.ends_with("-01"));
+            assert!(!traceparent.contains("ec2dbe8943832cb3ce012bca4a4988f3"));
+            traceparents.push(traceparent.to_owned());
+            assert!(headers.get("x-codex-beta-features").is_none());
+            assert!(upstream.get("client_metadata").is_none(), "{upstream}");
             assert_eq!(headers["accept"], "text/event-stream");
             assert_eq!(
                 headers["x-codex-routing-hint"],
@@ -4247,6 +4264,7 @@ mod tests {
                 assert_eq!(value["choices"][0]["message"]["content"], "pong");
             }
         }
+        assert_ne!(traceparents[0], traceparents[1]);
         let lite = inference(
             State(app.clone()),
             Request::builder()
