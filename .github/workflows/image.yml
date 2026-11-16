@@ -7,8 +7,8 @@ on:
   workflow_dispatch:
 
 # Pull requests run only the smoke job, whose token can read the repository.
-# Main and manual runs repeat that smoke test, archive the tested image, and
-# publish it from a second job. packages: write is only on that second job.
+# Main and manual runs repeat that smoke test and upload infer-local.tar.
+# actions: write is only on the archive job, for that upload.
 permissions:
   contents: read
 
@@ -35,7 +35,7 @@ jobs:
         run: bash deploy/e2e/smoke.sh
 
   archive:
-    name: kind smoke for publish
+    name: kind smoke and archive
     if: github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && github.ref == 'refs/heads/main')
     runs-on: ubuntu-latest
     permissions:
@@ -67,57 +67,3 @@ jobs:
           if-no-files-found: error
           retention-days: 1
           overwrite: true
-
-  publish:
-    name: publish GHCR
-    needs: archive
-    if: needs.archive.result == 'success'
-    runs-on: ubuntu-latest
-    permissions:
-      actions: read
-      packages: write
-    steps:
-      - name: Download the smoke-tested image
-        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
-        with:
-          name: infer-local
-          path: ${{ runner.temp }}/infer-image
-      - name: Load the smoke-tested image
-        env:
-          IMAGE_TAR: ${{ runner.temp }}/infer-image/infer-local.tar
-        run: docker load -i "$IMAGE_TAR"
-      - name: Log in to GHCR
-        uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-      - name: Push linux/amd64 image to GHCR
-        env:
-          IMAGE: ghcr.io/addomam/inference-gateway
-        run: |
-          set -euo pipefail
-          platform=$(docker image inspect infer:local --format '{{.Os}}/{{.Architecture}}')
-          if [[ "$platform" != "linux/amd64" ]]; then
-            echo "refusing to publish ${platform}" >&2
-            exit 1
-          fi
-          if [[ ! "${GITHUB_SHA}" =~ ^[0-9a-f]{40}$ ]]; then
-            echo "GITHUB_SHA is not a full commit sha" >&2
-            exit 1
-          fi
-          target="${IMAGE}:${GITHUB_SHA}"
-          docker tag infer:local "$target"
-          log=$(mktemp)
-          docker push --platform linux/amd64 "$target" 2>&1 | tee "$log"
-          unique=$(sed -n 's/.*digest: \(sha256:[0-9a-f]\{64\}\).*/\1/p' "$log" | LC_ALL=C sort -u)
-          if [[ ! "$unique" =~ ^sha256:[0-9a-f]{64}$ ]]; then
-            echo "docker push did not report one sha256 digest" >&2
-            exit 1
-          fi
-          printf 'published %s@%s\n' "$IMAGE" "$unique"
-          {
-            printf '### Published image\n\n'
-            printf '%s\n\n' "$unique"
-            printf '%s@%s\n' "$IMAGE" "$unique"
-          } >> "$GITHUB_STEP_SUMMARY"

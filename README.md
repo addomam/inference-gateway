@@ -810,7 +810,7 @@ cargo build --release --locked
 
 ## Kubernetes
 
-CI builds a distroless linux/amd64 image. A push to main, and a manual run, publishes the smoke-tested image to `ghcr.io/addomam/inference-gateway` tagged with the full commit SHA and writes the pushed `sha256` digest to the job summary. Pull requests build and smoke-test only. Build the same image locally when you need another architecture:
+CI builds a distroless linux/amd64 image. Pull requests build and smoke-test only. A push to main, and a manual run, repeat that smoke test and upload the tested image as the `infer-local` artifact (`infer-local.tar`). Build the same image locally when you need another architecture:
 
 ```sh
 docker build -t infer:local .
@@ -846,7 +846,7 @@ An init container, running as root with only `CHOWN`, changes `/var/lib/infer` t
 
 Requests and limits in the Deployment are a starting point (100m/256Mi requested, 1 CPU/1Gi limited), not a measured production profile. Routed bodies are buffered up to `max_request_bytes` (32 MiB by default).
 
-`deploy/e2e/smoke.sh` builds `infer:local`, starts a kind cluster, applies `deploy/overlays/e2e` with a Python chat stub, and checks one completion plus its trace. GitHub Actions runs that script on every image workflow and pushes the built image only from main and manual runs. The script deletes a cluster it created unless `KEEP_CLUSTER=1`.
+`deploy/e2e/smoke.sh` builds `infer:local`, starts a kind cluster, applies `deploy/overlays/e2e` with a Python chat stub, and checks one completion plus its trace. GitHub Actions runs that script on every image workflow. Main and manual runs also upload the tested image as `infer-local.tar`. The script deletes a cluster it created unless `KEEP_CLUSTER=1`.
 
 ## Integration validation
 
