@@ -8,7 +8,7 @@ on:
 
 # Pull requests run only the smoke job, whose token can read the repository.
 # Main and manual runs repeat that smoke test and upload infer-local.tar.
-# actions: write is only on the archive job, for that upload.
+# The archive job declares contents: read and actions: write.
 permissions:
   contents: read
 
@@ -65,5 +65,5 @@ jobs:
           name: infer-local
           path: ${{ runner.temp }}/infer-local.tar
           if-no-files-found: error
-          retention-days: 1
+          retention-days: 7
           overwrite: true
